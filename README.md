@@ -22,34 +22,54 @@ against a real GLAuth directory. See [project.md](project.md) §21.
 
 ## Install
 
+### Arch Linux
+
 ```sh
-make build
-sudo make install
+updpkgsums          # fills in the release checksum
+makepkg -si
 ```
 
-That places the binary in `/usr/local/bin`, the unit in
-`/usr/lib/systemd/system`, and `config.example.yaml` at
-`/etc/nginx-ldap-auth/config.yaml`.
+The package creates the system user, sets the modes on
+`/etc/nginx-ldap-auth`, and generates the cache pepper on first install — all
+of it declaratively, through `sysusers.d` and `tmpfiles.d` fragments, except
+the pepper, which cannot be in the package. See
+[packaging/README.md](packaging/README.md) for why.
 
-Then create the service user and the secrets:
+### From a release archive
+
+Each release carries a `linux/amd64` and a `linux/arm64` archive containing the
+binary, the systemd unit, the `sysusers.d` fragment, the example configuration
+and the nginx snippet. Those binaries are statically linked and run on any
+distribution.
+
+### From source
 
 ```sh
-sudo useradd --system --no-create-home --shell /usr/sbin/nologin nginx-ldap-auth
+make build
+sudo make install    # honours DESTDIR, PREFIX, SYSCONFDIR, UNITDIR
+```
 
-sudo install -dm0750 -o root -g nginx-ldap-auth /etc/nginx-ldap-auth
+`make install` places the same ten files the package does, under `/usr/local`
+by default. It does not create the system user or generate the pepper, because
+neither belongs to a build:
+
+```sh
+# The unit runs as this user. The sysusers fragment is the declarative form,
+# for a system where systemd applies it.
+sudo systemd-sysusers /usr/lib/sysusers.d/nginx-ldap-auth.conf
 
 # Keys the HMAC that derives cache keys from credentials. Without it a leaked
 # cache would be crackable offline against a wordlist.
-sudo sh -c 'openssl rand -hex 32 > /etc/nginx-ldap-auth/cache-pepper.secret'
+sudo make pepper
 
-# The service account the user and group searches run as.
+# The service account the user and group searches run as, if the directory
+# needs one.
 sudo sh -c 'printf %s "the-service-password" > /etc/nginx-ldap-auth/ldap-bind.secret'
-
-sudo chown root:nginx-ldap-auth /etc/nginx-ldap-auth/*.secret
-sudo chmod 0640 /etc/nginx-ldap-auth/*.secret
+sudo chown root:nginx-ldap-auth /etc/nginx-ldap-auth/ldap-bind.secret
+sudo chmod 0640 /etc/nginx-ldap-auth/ldap-bind.secret
 ```
 
-Check the configuration before starting anything:
+### Either way: check the configuration first
 
 ```sh
 sudo -u nginx-ldap-auth nginx-ldap-auth --check --config /etc/nginx-ldap-auth/config.yaml
@@ -270,11 +290,21 @@ process start is a counter that silently resets.
 ## Development
 
 ```sh
-make check     # go vet, go test -race, golangci-lint
-make test      # tests only
-make cover     # coverage summary
-make vuln      # govulncheck
+make help              # every target, with a one-line description
+make ci                # what CI runs: fmt, vet, lint, vuln, test (race), build
+make test              # tests with the race detector
+make test-integration  # the GLAuth suite (see below)
+make cover             # coverage summary
+make sec               # golangci-lint (incl. gosec) + govulncheck
 ```
+
+`make fmt` **fails** on unformatted code rather than rewriting it — a CI step
+that silently fixes what it was asked to check is not a check. Run
+`gofmt -w cmd internal` to fix.
+
+Pipelines: `.forgejo/workflows/` is the full gate and the release; Forgejo is
+primary. `.github/workflows/` is the mirror — a smoke build plus the release
+archives.
 
 ### The integration suite
 

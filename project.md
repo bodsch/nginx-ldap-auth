@@ -470,7 +470,9 @@ Intended modes:
 /etc/nginx-ldap-auth/cache-pepper.secret  0640 root:nginx-ldap-auth
 ```
 
-Startup must fail with a clear error if a referenced secret file is missing, empty or unreadable. A world-readable secret file should produce a warning rather than a refusal, so a misconfigured permission does not take down a running site on restart.
+Startup must fail with a clear error if a referenced secret file is missing, empty or unreadable. A secret file accessible to *other* — readable, writable or executable — produces a warning rather than a refusal, so a misconfigured permission does not take down a running site on restart.
+
+Group access is not a misconfiguration and must not warn. Root-owned and group-readable by the service user is the intended arrangement: it is what lets the unit run unprivileged without the secrets being writable by it, and it is what the `tmpfiles.d` fragment sets. An earlier implementation warned on any group-readable file, which meant it fired on every correct installation and advised `chmod 0640` on files that were already `0640` — a warning that fires on the intended setup teaches operators to ignore warnings.
 
 ## 9. HTTP API
 
@@ -787,21 +789,33 @@ The exact hardening options should be validated against the application's runtim
 
 ## 14. Package / installation
 
-The first implementation should support a straightforward native installation.
-
-Target paths:
+Native installation, three ways in: an Arch package, a release archive, or `make install`. All three place the same set of files.
 
 ```text
-/usr/local/bin/nginx-ldap-auth
+/usr/bin/nginx-ldap-auth                        (/usr/local/bin from make install)
 /etc/nginx-ldap-auth/config.yaml
 /usr/lib/systemd/system/nginx-ldap-auth.service
+/usr/lib/sysusers.d/nginx-ldap-auth.conf
+/usr/lib/tmpfiles.d/nginx-ldap-auth.conf
+/usr/share/doc/nginx-ldap-auth/...
+/usr/share/licenses/nginx-ldap-auth/LICENSE
 ```
 
-An Arch Linux PKGBUILD may be added later.
+A package must not install or modify nginx itself. nginx is an `optdepends`, not a dependency: the service is useful without it while a configuration is being written, the nginx package needs no modification to work with it, and a package that pulls in a web server because it can be used behind one decides too much.
 
-A package should not install or modify nginx itself.
+### What is declarative and what cannot be
 
-Installation must generate the cache pepper if it does not exist yet, with restrictive permissions, and must not overwrite an existing one.
+The system user comes from a `sysusers.d` fragment and the modes on `/etc/nginx-ldap-auth` from a `tmpfiles.d` fragment, rather than from `useradd` and `chown` in a post-install script. Both are idempotent, both apply on first boot of an image as well as on package installation, and neither can be half-applied. The modes in particular cannot be baked into the package at all: the group does not exist while the package is being built.
+
+The cache pepper is the exception, and the reason is the point of the pepper. It must not exist in the package — every installation would then share one secret, and a cache leaked from any of them would be crackable against all the others. So it is generated on the target machine, on first install, and never regenerated on upgrade. Installation must generate it if it does not exist yet, with restrictive permissions, and must not overwrite an existing one.
+
+### Static or hardened, not both
+
+The release archives are built without `-buildmode=pie` and are statically linked: one build runs on any distribution, which is what a downloadable archive is for.
+
+The Arch package adds `-buildmode=pie`, which with cgo disabled still produces a dynamically linked binary wanting the glibc loader — hence `depends=('glibc')`. That is the right trade for a distribution package, where the loader is present by definition and ASLR is worth having, and the wrong one for an archive that has to run anywhere.
+
+Neither build enables cgo, because the systemd unit sets `MemoryDenyWriteExecute=true` and says in its own comment that this is safe for a binary built without it.
 
 ## 15. Project structure
 
@@ -825,8 +839,15 @@ nginx-ldap-auth/
 │   └── nginx-ldap-auth.service
 ├── nginx/
 │   └── auth.conf
+├── packaging/
+│   ├── nginx-ldap-auth.sysusers    # creates the system user
+│   ├── nginx-ldap-auth.tmpfiles    # modes on /etc/nginx-ldap-auth
+│   └── nginx-ldap-auth.install     # generates the cache pepper, once
 ├── testdata/
 │   └── glauth/         # GLAuth fixture config for integration tests
+├── .forgejo/workflows/ # the full gate and the release; primary
+├── .github/workflows/  # the mirror: smoke build and release archives
+├── PKGBUILD
 ├── config.example.yaml
 ├── go.mod
 ├── go.sum
@@ -998,7 +1019,7 @@ The goal is a small authentication component that fills the gap between nginx an
 1. ~~Prometheus metrics and `/metrics`~~
 2. ~~Redis cache backend~~
 3. ~~Integration tests against a GLAuth binary~~
-4. Arch Linux PKGBUILD
+4. ~~Arch Linux PKGBUILD~~
 
 Metrics, Redis and the integration suite were moved out of the first milestone deliberately. None of them changes whether the service authenticates correctly, and the original seventeen-point milestone was not the "intentionally small" first step it claimed to be.
 

@@ -1,0 +1,79 @@
+# shellcheck shell=bash
+#
+# The one thing that cannot be done declaratively: generating the cache pepper.
+#
+# It must not be created at package build time. Every installation would then
+# share one secret, and a cache leaked from any of them would be crackable
+# against all the others — which is exactly the property the pepper exists to
+# provide.
+
+_pepper=/etc/nginx-ldap-auth/cache-pepper.secret
+
+_generate_pepper() {
+	if [ -f "${_pepper}" ]; then
+		return 0
+	fi
+
+	install -dm0750 "$(dirname "${_pepper}")"
+
+	# umask rather than a chmod afterwards: the file must never exist, even
+	# briefly, with a mode that lets another user read it.
+	(umask 027 && openssl rand -hex 32 >"${_pepper}")
+
+	printf '  generated %s\n' "${_pepper}"
+}
+
+post_install() {
+	_generate_pepper
+
+	cat <<'MESSAGE'
+
+nginx-ldap-auth is installed but not yet configured.
+
+  1. Edit /etc/nginx-ldap-auth/config.yaml — at minimum the ldap section and
+     the policies that reference it.
+
+  2. If the directory needs a service account, write its password:
+       printf %s 'the-password' > /etc/nginx-ldap-auth/ldap-bind.secret
+       chown root:nginx-ldap-auth /etc/nginx-ldap-auth/ldap-bind.secret
+       chmod 0640 /etc/nginx-ldap-auth/ldap-bind.secret
+
+  3. Check the configuration before starting anything. It reports every
+     problem it finds at once:
+       nginx-ldap-auth --check --config /etc/nginx-ldap-auth/config.yaml
+
+  4. systemctl enable --now nginx-ldap-auth
+
+  5. Wire up nginx. A complete server block is in
+     /usr/share/doc/nginx-ldap-auth/examples/auth.conf
+
+The cache pepper has been generated. Keep it out of backups that travel, and
+note that replacing it invalidates the cache — which is harmless, given the
+60 second default TTL.
+
+MESSAGE
+}
+
+post_upgrade() {
+	# An installation that predates the pepper, or one whose pepper was
+	# removed, gets one here. An existing one is never touched: replacing it
+	# would silently invalidate every cache entry on every upgrade.
+	_generate_pepper
+
+	cat <<'MESSAGE'
+
+Check the configuration against the new build before restarting:
+  nginx-ldap-auth --check --config /etc/nginx-ldap-auth/config.yaml
+
+MESSAGE
+}
+
+post_remove() {
+	cat <<'MESSAGE'
+
+The configuration and the secrets in /etc/nginx-ldap-auth have been left in
+place. Remove them by hand if this was not a reinstall:
+  rm -rf /etc/nginx-ldap-auth
+
+MESSAGE
+}

@@ -1,0 +1,16 @@
+# systemd-tmpfiles fragment.
+#
+# Fixes the ownership and mode of the configuration directory and the files in
+# it. Declarative rather than a chown in the post-install script, because the
+# system user does not exist while the package is being built — so the modes
+# cannot be baked into the package, and they have to be applied on the target
+# machine.
+#
+# The directory is group-readable by the service and nothing else: the
+# configuration itself holds no secrets, but it names the files that do, and
+# those live in the same directory.
+d /etc/nginx-ldap-auth                          0750 root nginx-ldap-auth -
+z /etc/nginx-ldap-auth/config.yaml              0640 root nginx-ldap-auth -
+z /etc/nginx-ldap-auth/cache-pepper.secret      0640 root nginx-ldap-auth -
+z /etc/nginx-ldap-auth/ldap-bind.secret         0640 root nginx-ldap-auth -
+z /etc/nginx-ldap-auth/redis.secret             0640 root nginx-ldap-auth -

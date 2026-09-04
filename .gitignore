@@ -1,10 +1,17 @@
-# The replaced original stays local.
-original
-
 # Build artefacts
 bin
 dist
 coverage.out
+
+# makepkg working directories and output
+pkg
+src
+*.pkg.tar.zst
+*.pkg.tar.zst.sig
+*.tar.gz
+
+# Generated from the PKGBUILD, and stale the moment pkgver changes.
+.SRCINFO
 
 # The fuzz corpus with found cases is kept, the cache is not
 testdata/fuzz/*/[0-9a-f]*

@@ -122,10 +122,21 @@ func readSecretFile(path string) (secret []byte, warning string, err error) {
 		return nil, "", err
 	}
 
+	// Only the "other" bits are a problem, and every one of them is.
+	//
+	// Group access is the intended arrangement, not a mistake: the files are
+	// root-owned and group-readable by the service user, which is what lets
+	// the unit run unprivileged without the secrets being writable by it.
+	// An earlier version warned on group-readable too, which meant it fired
+	// on the correct deployment and recommended the exact mode the file
+	// already had. A warning that fires on the intended setup teaches
+	// operators to ignore warnings.
+	//
 	// Reported rather than refused: a wrong mode on a running system should
 	// be loud, but it must not turn the next routine restart into an outage.
-	if mode := info.Mode().Perm(); mode&0o044 != 0 {
-		warning = fmt.Sprintf("%s is readable beyond its owner and group (mode %04o); restrict it with: chmod 0640 %s",
+	if mode := info.Mode().Perm(); mode&0o007 != 0 {
+		warning = fmt.Sprintf(
+			"%s is accessible to every user on the system (mode %04o); restrict it with: chmod 0640 %s",
 			path, mode, path)
 	}
 

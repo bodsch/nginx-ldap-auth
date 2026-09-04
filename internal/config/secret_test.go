@@ -85,12 +85,66 @@ func TestReadSecretFileWarnsAboutPermissions(t *testing.T) {
 		t.Errorf("secret = %q, want the file to still be read", secret)
 	}
 
-	if !strings.Contains(warning, "readable beyond its owner") {
+	if !strings.Contains(warning, "every user on the system") {
 		t.Errorf("warning = %q, want it to name the permission problem", warning)
 	}
 
 	if !strings.Contains(warning, "chmod 0640") {
 		t.Errorf("warning = %q, want it to name the fix", warning)
+	}
+}
+
+// TestReadSecretFileAcceptsTheDeployedMode is a regression test.
+//
+// The deployed arrangement is root-owned, group-readable by the service user:
+// that is what lets the unit run unprivileged without the secrets being
+// writable by it, and it is the mode the tmpfiles fragment sets.
+//
+// An earlier version warned on any group-readable file, so it fired on every
+// correct installation — and told the operator to "chmod 0640" a file that was
+// already 0640. A warning that fires on the intended setup and recommends the
+// state it is complaining about is worse than no warning: it teaches people to
+// ignore the ones that matter.
+func TestReadSecretFileAcceptsTheDeployedMode(t *testing.T) {
+	for _, mode := range []os.FileMode{0o600, 0o640, 0o440} {
+		path := writeFile(t, "bind.secret", "s3cret", mode)
+
+		// os.WriteFile applies the process umask, so the mode has to be
+		// set explicitly to be sure of what is being tested.
+		if err := os.Chmod(path, mode); err != nil {
+			t.Fatalf("chmod: %v", err)
+		}
+
+		_, warning, err := readSecretFile(path)
+		if err != nil {
+			t.Fatalf("mode %04o: readSecretFile: %v", mode, err)
+		}
+
+		if warning != "" {
+			t.Errorf("mode %04o warned: %s", mode, warning)
+		}
+	}
+}
+
+// TestReadSecretFileWarnsAboutEveryOtherBit: read, write and execute for
+// "other" are all wrong on a secret, and world-writable is the worst of the
+// three.
+func TestReadSecretFileWarnsAboutEveryOtherBit(t *testing.T) {
+	for _, mode := range []os.FileMode{0o604, 0o602, 0o601, 0o666} {
+		path := writeFile(t, "bind.secret", "s3cret", mode)
+
+		if err := os.Chmod(path, mode); err != nil {
+			t.Fatalf("chmod: %v", err)
+		}
+
+		_, warning, err := readSecretFile(path)
+		if err != nil {
+			t.Fatalf("mode %04o: readSecretFile: %v", mode, err)
+		}
+
+		if warning == "" {
+			t.Errorf("mode %04o did not warn", mode)
+		}
 	}
 }
 

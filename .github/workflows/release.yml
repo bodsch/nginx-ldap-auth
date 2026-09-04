@@ -1,0 +1,190 @@
+# Release pipeline for nginx-ldap-auth.
+#
+# Triggered automatically when a semver tag (e.g. 1.2.3 or v1.2.3) is pushed
+# to GitHub via the Forgejo->GitHub mirror, or manually via workflow_dispatch
+# with the target tag as input.
+#
+# Produces a GitHub Release containing:
+#   - Static binaries for linux/amd64 and linux/arm64
+#   - Each bundled as a tar.gz together with everything needed to deploy it:
+#     the systemd unit, the sysusers fragment, the example configuration, the
+#     nginx snippet, LICENSE and README
+#   - Accompanied by a SHA-256 checksum file per archive
+#
+# The binaries embed the release version and build date via -ldflags into
+# main.version / main.buildDate.
+#
+# Linux only, deliberately. The service is a systemd unit behind nginx; it
+# builds and tests cleanly on darwin, which is what makes development there
+# work, but a darwin release artefact would have nothing to be installed into.
+
+name: release
+
+on:
+  push:
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g. 1.2.3). Required for manual dispatch."
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PACKAGE_NAME: nginx-ldap-auth
+  CMD_PATH: ./cmd/nginx-ldap-auth
+
+jobs:
+  verify:
+    name: verify
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Vet
+        run: make vet
+
+      # The race detector needs cgo, which the runner has. Releasing an
+      # authentication service without running its tests is not a saving worth
+      # making.
+      - name: Test
+        run: make test
+
+  build:
+    name: build ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: verify
+    runs-on: ubuntu-22.04
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux, goarch: amd64 }
+          - { goos: linux, goarch: arm64 }
+
+    outputs:
+      tag: ${{ steps.ver.outputs.tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Resolve release tag
+        id: ver
+        run: |
+          set -eu
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${{ github.event.inputs.tag }}"
+          else
+            tag="${{ github.ref_name }}"
+          fi
+          [ -n "$tag" ] || { echo "Empty tag." >&2; exit 1; }
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Releasing tag: $tag"
+
+      - name: Build static binary
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -eu
+          version="${{ steps.ver.outputs.tag }}"
+          build_date="$(date -u +%Y-%m-%d)"
+          mkdir -p dist
+          go build -trimpath \
+            -ldflags "-s -w -X main.version=${version} -X main.buildDate=${build_date}" \
+            -o "dist/${PACKAGE_NAME}" \
+            "${CMD_PATH}"
+
+      - name: Bundle release archive
+        run: |
+          set -eu
+          version="${{ steps.ver.outputs.tag }}"
+          base="${PACKAGE_NAME}_${version}_${{ matrix.goos }}_${{ matrix.goarch }}"
+          archive="${base}.tar.gz"
+
+          # Stage all release contents in a clean directory before tar'ing,
+          # so the archive has a flat, predictable layout.
+          #
+          # The deployment files travel with the binary on purpose: a download
+          # that contains only the binary cannot be deployed, and whoever
+          # unpacks it would have to go back to the repository for the unit and
+          # the example configuration.
+          stage="$(mktemp -d)"
+          install -m 0755 "dist/${PACKAGE_NAME}" "${stage}/${PACKAGE_NAME}"
+          install -m 0644 LICENSE README.md config.example.yaml "${stage}/"
+          install -Dm 0644 systemd/${PACKAGE_NAME}.service "${stage}/systemd/${PACKAGE_NAME}.service"
+          install -Dm 0644 packaging/${PACKAGE_NAME}.sysusers "${stage}/packaging/${PACKAGE_NAME}.sysusers"
+          install -Dm 0644 nginx/auth.conf "${stage}/nginx/auth.conf"
+
+          tar -C "${stage}" -czf "dist/${archive}" .
+          ( cd dist && sha256sum "${archive}" > "${archive}.sha256" )
+          rm -rf "${stage}"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: release-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-22.04
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v8.0.1
+        with:
+          path: dist/
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la dist/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3.0.0
+        with:
+          tag_name: ${{ needs.build.outputs.tag }}
+          name: ${{ needs.build.outputs.tag }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256

@@ -1,0 +1,10 @@
+# systemd-sysusers fragment.
+#
+# Creates the unprivileged system user the unit runs as. A sysusers fragment
+# rather than a useradd call in a post-install script: it is declarative, it is
+# idempotent, and systemd applies it on first boot of an image as well as on
+# package installation.
+#
+# No home directory and no shell: the account exists to own a listening socket
+# and to read three files in /etc.
+u nginx-ldap-auth - "nginx LDAP authentication service" - -

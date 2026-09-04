@@ -25,8 +25,17 @@ import (
 	"bodsch.me/nginx-ldap-auth/internal/server"
 )
 
-// version is overridden at build time with -ldflags "-X main.version=...".
-var version = "dev"
+// version and buildDate are stamped at build time with
+//
+//	-ldflags "-X main.version=... -X main.buildDate=..."
+//
+// buildDate is a UTC day rather than a timestamp: it keeps two builds of the
+// same release comparable, and it is coarse enough not to make an otherwise
+// identical rebuild differ by the second.
+var (
+	version   = "dev"
+	buildDate = "unknown"
+)
 
 func main() {
 	if err := run(os.Args[1:], os.Stdout, os.Stderr); err != nil {
@@ -48,8 +57,8 @@ func run(args []string, stdout, stderr io.Writer) error {
 	}
 
 	if *showVersion {
-		fmt.Fprintf(stdout, "nginx-ldap-auth %s (%s, %s/%s)\n",
-			version, runtime.Version(), runtime.GOOS, runtime.GOARCH)
+		fmt.Fprintf(stdout, "nginx-ldap-auth %s (built %s, %s, %s/%s, revision %s)\n",
+			version, buildDate, runtime.Version(), runtime.GOOS, runtime.GOARCH, revision())
 
 		return nil
 	}
@@ -362,6 +371,7 @@ func newLogger(cfg config.Logging, out io.Writer) *slog.Logger {
 func logStartup(log *slog.Logger, cfg *config.Config, policies *policy.Set, decisionCache cache.Cache) {
 	log.Info("starting",
 		slog.String("version", version),
+		slog.String("build_date", buildDate),
 		slog.String("go", runtime.Version()),
 		slog.String("revision", revision()),
 	)

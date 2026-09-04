@@ -196,7 +196,7 @@ cache:
 		t.Fatal("expected the invalid logging level to be refused")
 	}
 
-	if !strings.Contains(stderr, "readable beyond its owner") {
+	if !strings.Contains(stderr, "accessible to every user on the system") {
 		t.Errorf("stderr = %q, want the permission warning reported alongside the error", stderr)
 	}
 }

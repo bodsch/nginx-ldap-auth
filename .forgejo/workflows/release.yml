@@ -1,0 +1,63 @@
+# Forgejo Actions release — on a version tag (v*), cross-compiles the static
+# binaries and publishes them (with checksums) as release assets.
+#
+# This follows the house style of the sibling Go services.
+#
+# Prerequisites (in addition to the CI ones):
+#   - The forgejo-release action reachable at code.forgejo.org.
+#   - The automatic ${{ secrets.GITHUB_TOKEN }} has package/release write scope
+#     (default in Forgejo Actions). Adjust the action version/token to your
+#     instance if needed.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build release binaries
+        # VERSION comes from the tag (e.g. v0.2.0) so the embedded build info is
+        # correct.
+        run: make release VERSION="${{ github.ref_name }}"
+
+      # The deployment files are part of the release, not an afterthought: the
+      # binary alone cannot be deployed. Whoever downloads a release gets the
+      # unit, the sysusers fragment, the example configuration and the nginx
+      # snippet in the same place.
+      - name: Bundle the deployment files
+        run: |
+          set -eu
+          tar -czf dist/nginx-ldap-auth-deploy-"${{ github.ref_name }}".tar.gz \
+            --transform 's,^,nginx-ldap-auth/,' \
+            systemd/nginx-ldap-auth.service \
+            packaging/nginx-ldap-auth.sysusers \
+            config.example.yaml \
+            nginx/auth.conf \
+            LICENSE \
+            README.md
+
+      - name: Checksums
+        # The binaries land in dist/, one per platform; the checksum file joins
+        # them there so it is uploaded with the same release-dir.
+        run: cd dist && sha256sum * > SHA256SUMS
+
+      - name: Publish release
+        uses: https://code.forgejo.org/actions/forgejo-release@v2
+        with:
+          direction: upload
+          url: ${{ github.server_url }}
+          repo: ${{ github.repository }}
+          tag: ${{ github.ref_name }}
+          release-dir: dist
+          token: ${{ secrets.GITHUB_TOKEN }}

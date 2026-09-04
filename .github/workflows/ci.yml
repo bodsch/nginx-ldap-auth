@@ -1,0 +1,32 @@
+# Continuous integration: smoke build of the Go module.
+# Runs on every push to main, on merge/pull requests, and on manual dispatch.
+# Does NOT publish anything - releasing is handled by release.yml.
+#
+# GitHub is the mirror, Forgejo is primary: the full gate (gofmt, vet,
+# golangci-lint, govulncheck, race tests, the GLAuth integration suite) runs in
+# .forgejo/workflows/ci.yml. This job only catches a mirror that pushed
+# something which does not compile.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+
+      - uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Build (smoke)
+        run: |
+          go build -trimpath -o /tmp/nginx-ldap-auth ./cmd/nginx-ldap-auth
+          ls -lth /tmp/nginx-ldap-auth
