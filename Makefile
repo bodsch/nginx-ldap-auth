@@ -48,6 +48,21 @@ DOCDIR      ?= $(PREFIX)/share/doc/$(BINARY)
 GO       := go
 GOLANGCI := golangci-lint
 
+# The linter version has one definition, here, so that a local run and CI use
+# the same one. It bundles its own copy of staticcheck, which builds an IR of
+# the standard library — so a linter older than the Go toolchain does not report
+# findings, it panics. That is how this pin came to matter: v2.12.2 crashed on
+# Go 1.27.1's internal/poll with "unexpected expr: *ast.KeyValueExpr", exit 3,
+# and took the rest of the pipeline with it.
+#
+# Bump this together with the Go version in go.mod, not separately.
+GOLANGCI_VERSION ?= v2.13.2
+
+# The directory the integration suite runs against. It is not a module
+# dependency — the suite starts it as a separate process — so its version is
+# pinned here rather than in go.mod.
+GLAUTH_VERSION ?= latest
+
 .DEFAULT_GOAL := build
 
 .PHONY: help
@@ -85,11 +100,20 @@ vet: ## Run go vet.
 
 .PHONY: lint
 lint: ## Run golangci-lint (uses .golangci.yml if present).
-	@command -v $(GOLANGCI) >/dev/null 2>&1 || { \
-		echo "$(GOLANGCI) not found — install it from https://golangci-lint.run/welcome/install/"; \
+	@command -v $(GOLANGCI) >/dev/null 2>&1 || test -x "$$($(GO) env GOPATH)/bin/$(GOLANGCI)" || { \
+		echo "$(GOLANGCI) not found — run 'make lint-install', or install it from"; \
+		echo "https://golangci-lint.run/welcome/install/"; \
 		exit 1; \
 	}
-	$(GOLANGCI) run ./...
+	@PATH="$$($(GO) env GOPATH)/bin:$$PATH" $(GOLANGCI) run ./...
+
+.PHONY: lint-install
+lint-install: ## Install the pinned golangci-lint into GOPATH/bin.
+	$(GO) install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_VERSION)
+
+.PHONY: glauth-install
+glauth-install: ## Install the GLAuth directory the integration suite runs against.
+	$(GO) install github.com/glauth/glauth/v2@$(GLAUTH_VERSION)
 
 .PHONY: vuln
 vuln: ## Scan deps and reachable code for known vulnerabilities (govulncheck).
@@ -103,8 +127,26 @@ tidy: ## Tidy and verify go.mod/go.sum.
 	$(GO) mod tidy
 	$(GO) mod verify
 
+# A shipped example configuration that cannot even be loaded would be a broken
+# package. The secrets it references do not exist in a checkout, so throwaway
+# ones are created first — with a mode the loader does not warn about, because
+# a check whose output is mostly warnings about its own scaffolding is a check
+# nobody reads.
+.PHONY: check-example
+check-example: build ## Verify the shipped example configuration loads.
+	@set -eu; \
+	tmp="$$(mktemp -d)"; \
+	trap 'rm -rf "$$tmp"' EXIT; \
+	umask 027; \
+	openssl rand -hex 32 > "$$tmp/cache-pepper.secret"; \
+	printf 'servicepassword' > "$$tmp/ldap-bind.secret"; \
+	sed -e "s#$(SYSCONFDIR)/$(BINARY)/cache-pepper.secret#$$tmp/cache-pepper.secret#" \
+	    -e "s#$(SYSCONFDIR)/$(BINARY)/ldap-bind.secret#$$tmp/ldap-bind.secret#" \
+	    config.example.yaml > "$$tmp/config.yaml"; \
+	$(BIN_DIR)/$(BINARY) --check --config "$$tmp/config.yaml"
+
 .PHONY: ci
-ci: fmt vet lint vuln test build ## Full CI pipeline: fmt, vet, lint, vuln, test (race), build.
+ci: fmt vet lint vuln test build check-example ## Full CI pipeline: fmt, vet, lint, vuln, test (race), build, example.
 
 .PHONY: release
 release: ## Cross-compile static release binaries into dist/.

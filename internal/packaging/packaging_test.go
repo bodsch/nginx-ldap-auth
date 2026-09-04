@@ -451,3 +451,119 @@ func TestPepperIsGeneratedOnceAndNeverReplaced(t *testing.T) {
 		t.Error("the restored pepper is identical to the removed one, which cannot be random")
 	}
 }
+
+// TestForgejoCIRunsOnlyMakeTargets is the claim the workflow makes in its own
+// header: "Every step is a `make` target, so the same checks run locally and
+// here."
+//
+// It was not true. The golangci-lint step installed and invoked the linter
+// inline, with a version pinned in the workflow — so the pin drifted from the
+// one a developer runs locally, and a linter older than the Go toolchain
+// reached CI. It did not report findings: staticcheck builds an IR of the
+// standard library, so it panicked on Go 1.27.1's internal/poll, exited 3, and
+// took every step after it with it. The pipeline reported "lint failed" for a
+// crash inside the linter, on code that was fine.
+//
+// The point of the claim is that a check which cannot be reproduced locally is
+// a check nobody can act on. This test is what keeps it true.
+func TestForgejoCIRunsOnlyMakeTargets(t *testing.T) {
+	root := repoRoot(t)
+	workflow := read(t, root, ".forgejo/workflows/ci.yml")
+
+	// There are deliberately no exceptions. Every step the workflow runs is
+	// reproducible with one make invocation, which is what the header claims
+	// and what makes a red pipeline actionable. A new step that needs shell
+	// belongs in a make target, not here — the example-config check started
+	// out as eight lines of shell in this file and became `make
+	// check-example` for exactly that reason.
+	steps := shellSteps(workflow)
+	if len(steps) == 0 {
+		t.Fatal("no run: steps found, so this test is not working")
+	}
+
+	sawMake := false
+
+	for _, line := range steps {
+		if strings.HasPrefix(line, "make ") {
+			sawMake = true
+
+			continue
+		}
+
+		t.Errorf("the CI workflow runs %q, which is not a make target; a check that cannot be "+
+			"reproduced with one make invocation is one nobody can act on", line)
+	}
+
+	if !sawMake {
+		t.Error("no make target is called at all, so the extraction is not working")
+	}
+}
+
+// TestLinterVersionIsPinnedInTheMakefile: the version has to live where both a
+// local run and CI read it from. A second copy in a workflow is a copy that
+// drifts, and the drift is not visible until the linter crashes.
+func TestLinterVersionIsPinnedInTheMakefile(t *testing.T) {
+	root := repoRoot(t)
+
+	makefile := read(t, root, "Makefile")
+
+	pin := regexp.MustCompile(`(?m)^GOLANGCI_VERSION \?= (v[0-9]+\.[0-9]+\.[0-9]+)`)
+	if !pin.MatchString(makefile) {
+		t.Fatal("the Makefile does not pin GOLANGCI_VERSION")
+	}
+
+	for _, workflow := range workflowFiles(t, root) {
+		contents := read(t, root, workflow)
+
+		if strings.Contains(contents, "golangci-lint@v") {
+			t.Errorf("%s pins a linter version of its own; the Makefile's pin is then not the "+
+				"one CI uses", workflow)
+		}
+	}
+}
+
+// shellSteps returns the individual commands of every `run:` block in a
+// workflow, with comments, blank lines and YAML continuation noise removed.
+func shellSteps(workflow string) []string {
+	var steps []string
+
+	lines := strings.Split(workflow, "\n")
+
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+
+		if !strings.HasPrefix(trimmed, "run:") {
+			continue
+		}
+
+		// A single-line `run: make vet`.
+		if inline := strings.TrimSpace(strings.TrimPrefix(trimmed, "run:")); inline != "" && inline != "|" {
+			steps = append(steps, inline)
+
+			continue
+		}
+
+		// A block. Everything more deeply indented than the `run:` key
+		// belongs to it.
+		indent := len(line) - len(strings.TrimLeft(line, " "))
+
+		for _, body := range lines[i+1:] {
+			if strings.TrimSpace(body) == "" {
+				continue
+			}
+
+			if len(body)-len(strings.TrimLeft(body, " ")) <= indent {
+				break
+			}
+
+			command := strings.TrimSpace(body)
+			if command == "" || strings.HasPrefix(command, "#") {
+				continue
+			}
+
+			steps = append(steps, command)
+		}
+	}
+
+	return steps
+}

@@ -36,10 +36,15 @@ jobs:
       - name: go vet
         run: make vet
 
+      # Through make, like every other step. This one used to install and
+      # invoke the linter inline with its own pinned version — which is how the
+      # pin drifted from the one a developer runs locally, and how a linter
+      # older than the Go toolchain got into CI and panicked instead of
+      # reporting findings. The version now has one definition, in the Makefile.
       - name: golangci-lint (incl. gosec)
         run: |
-          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
-          "$(go env GOPATH)/bin/golangci-lint" run ./...
+          make lint-install
+          make lint
 
       - name: govulncheck
         run: make vuln
@@ -48,11 +53,11 @@ jobs:
         run: make test
 
       # The integration suite runs a real GLAuth as a separate process. It is
-      # not a module dependency, so it is installed here rather than vendored —
-      # and it is a separate step so that a failure says "the directory
-      # integration broke", not "the tests broke".
+      # not a module dependency, so it is installed rather than vendored — and
+      # it is a separate step so that a failure says "the directory integration
+      # broke", not "the tests broke".
       - name: Install GLAuth
-        run: go install github.com/glauth/glauth/v2@latest
+        run: make glauth-install
 
       - name: Integration suite (real GLAuth directory)
         run: make test-integration
@@ -60,21 +65,7 @@ jobs:
       - name: Build
         run: make build
 
-      # A configuration file that the shipped example cannot even load would be
-      # a broken package. The secrets the example references do not exist in CI,
-      # so they are created first — with throwaway values, which is all --check
-      # needs.
+      # A shipped example configuration that cannot even be loaded would be a
+      # broken package.
       - name: Validate the example configuration
-        run: |
-          set -eu
-          tmp="$(mktemp -d)"
-          # The loader warns about a secret file readable beyond its owner and
-          # group, and it is right to. Creating them correctly here keeps the
-          # step's output to the answer it was run for.
-          umask 027
-          openssl rand -hex 32 > "$tmp/cache-pepper.secret"
-          printf 'servicepassword' > "$tmp/ldap-bind.secret"
-          sed -e "s#/etc/nginx-ldap-auth/cache-pepper.secret#$tmp/cache-pepper.secret#" \
-              -e "s#/etc/nginx-ldap-auth/ldap-bind.secret#$tmp/ldap-bind.secret#" \
-              config.example.yaml > "$tmp/config.yaml"
-          ./bin/nginx-ldap-auth --check --config "$tmp/config.yaml"
+        run: make check-example

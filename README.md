@@ -291,16 +291,26 @@ process start is a counter that silently resets.
 
 ```sh
 make help              # every target, with a one-line description
-make ci                # what CI runs: fmt, vet, lint, vuln, test (race), build
+make ci                # exactly what CI runs
 make test              # tests with the race detector
 make test-integration  # the GLAuth suite (see below)
+make check-example     # verify the shipped example configuration loads
 make cover             # coverage summary
 make sec               # golangci-lint (incl. gosec) + govulncheck
 ```
 
+Every CI step is one `make` invocation, and a test asserts it. A check that
+cannot be reproduced locally is a check nobody can act on — and the linter
+version lives in the Makefile for the same reason: pinned separately in the
+workflow, it drifted, and a linter older than the Go toolchain does not report
+findings, it crashes.
+
 `make fmt` **fails** on unformatted code rather than rewriting it — a CI step
 that silently fixes what it was asked to check is not a check. Run
 `gofmt -w cmd internal` to fix.
+
+Bump `GOLANGCI_VERSION` in the Makefile together with the Go version in
+`go.mod`, not separately.
 
 Pipelines: `.forgejo/workflows/` is the full gate and the release; Forgejo is
 primary. `.github/workflows/` is the mirror — a smoke build plus the release

@@ -3,6 +3,9 @@ bin
 dist
 coverage.out
 
+# Scratch: downloaded CI logs and similar.
+tmp
+
 # makepkg working directories and output
 pkg
 src
