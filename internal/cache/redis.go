@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync/atomic"
 	"time"
 
@@ -46,6 +47,31 @@ type RedisOptions struct {
 	Password string
 	Timeout  time.Duration
 	Observer Observer
+
+	// Logger receives the client library's own diagnostics. Without it they
+	// go to stderr through the standard log package — see redisLogger.
+	Logger *slog.Logger
+}
+
+// redisLogger routes the client library's diagnostics into the service's
+// logger.
+//
+// go-redis logs through the standard log package, straight to stderr,
+// unstructured and unaffected by the configured level. During an outage it
+// emits roughly three lines per operation — and nginx issues one authentication
+// request per HTTP request, so a single page view with thirty assets produces
+// about a hundred lines that a JSON log pipeline cannot parse.
+//
+// They are logged at debug because they are already reported where it matters:
+// the failure surfaces as a cache error counter, and the startup probe says so
+// once in a structured record. What is left is per-operation detail that is
+// useful when looking for it and noise otherwise.
+type redisLogger struct {
+	log *slog.Logger
+}
+
+func (l redisLogger) Printf(ctx context.Context, format string, v ...any) {
+	l.log.DebugContext(ctx, fmt.Sprintf(format, v...))
 }
 
 // storedDecision is the wire format.
@@ -68,6 +94,14 @@ func NewRedis(opts RedisOptions) (*Redis, error) {
 
 	if opts.Timeout <= 0 {
 		return nil, fmt.Errorf("timeout must be positive")
+	}
+
+	// Package-level state in the client library, so this is a side effect on
+	// a global — but the alternative is unstructured stderr output that no
+	// configuration can turn off, and there is exactly one Redis client in
+	// this process.
+	if opts.Logger != nil {
+		redis.SetLogger(redisLogger{log: opts.Logger.With(slog.String("component", "redis"))})
 	}
 
 	return &Redis{

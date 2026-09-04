@@ -65,10 +65,15 @@ func run(args []string, stdout, stderr io.Writer) error {
 
 	cfg, warnings, err := config.Load(*configPath)
 
-	// Warnings are reported even when loading failed: a bad file mode found
-	// alongside a validation error is still worth fixing in the same pass.
-	for _, warning := range warnings {
-		fmt.Fprintf(stderr, "warning: %s\n", warning)
+	// Plain text only while there is no logger to use: when loading failed,
+	// and for --check, where the reader is a person at a terminal rather
+	// than a log pipeline. A warning is reported even when loading failed —
+	// a bad file mode found alongside a validation error is still worth
+	// fixing in the same pass.
+	if err != nil || *checkOnly {
+		for _, warning := range warnings {
+			fmt.Fprintf(stderr, "warning: %s\n", warning)
+		}
 	}
 
 	if err != nil {
@@ -84,9 +89,9 @@ func run(args []string, stdout, stderr io.Writer) error {
 
 	log := newLogger(cfg.Logging, stdout)
 
-	// Re-logged through the structured logger so that the journal carries
-	// them in the same form as everything else. The plain-text copy above
-	// is what an operator running --check sees.
+	// Through the structured logger, and only there, so the journal carries
+	// one record per warning in the same form as everything else. Printing
+	// them plain as well produced every warning twice.
 	for _, warning := range warnings {
 		log.Warn("configuration warning", slog.String("detail", warning))
 	}
@@ -306,6 +311,7 @@ func newCache(
 		Password: cfg.Redis.Password,
 		Timeout:  cfg.Redis.Timeout.Duration(),
 		Observer: observer,
+		Logger:   log,
 	})
 	if err != nil {
 		return nil, nil, release, err

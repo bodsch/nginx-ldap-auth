@@ -77,7 +77,10 @@ func (c *stateCollector) Describe(out chan<- *prometheus.Desc) {
 // Collect implements prometheus.Collector.
 func (c *stateCollector) Collect(out chan<- prometheus.Metric) {
 	if c.cache != nil {
-		backend := c.cache.Name()
+		// Bounded like every other label: the name comes from a Cache
+		// implementation, and a future one naming itself after its
+		// address would be one series per instance.
+		backend := bounded(knownBackends, c.cache.Name())
 		stats := c.cache.Stats()
 
 		// Only emitted when the backend can answer without a round

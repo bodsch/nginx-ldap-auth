@@ -636,7 +636,11 @@ operation="bind|service_bind|search"
 backend="memory|redis"
 ```
 
-Every one of these is bounded inside the metrics layer rather than by whoever calls it. The exposition is scraped and usually kept for months, so a label value is long-term storage that nobody audits — and cardinality is a denial of service against the scrape, which takes every other metric down with it.
+Every one of these is bounded inside the metrics layer rather than by whoever calls it, against a closed set of permitted values. The exposition is scraped and usually kept for months, so a label value is long-term storage that nobody audits — and cardinality is a denial of service against the scrape, which takes every other metric down with it.
+
+The values are all constants in the packages that report them, so the bounding is in principle redundant. It is there because that is a property of another package: this layer cannot enforce it, and the cost of being wrong is not a missing data point but unbounded cardinality. A value outside its set is recorded as `other` rather than dropped, because a metric that silently loses observations is worse than one with a visible bucket that prompts someone to look.
+
+The `code` label is bounded too. It is an integer and so cannot carry an arbitrary string, but a handler bug can make it carry an arbitrary number, and one series per invented code is the same problem. Anything outside 100-599 is recorded as `0`.
 
 ## 11. Logging
 
@@ -668,6 +672,14 @@ Logs must never contain:
 Usernames are a special case: they are needed to investigate a lockout or a throttle, but users do type passwords into the username field by accident. `logging.log_username` controls this and defaults to on, since a directory administrator can see usernames anyway.
 
 Authentication failures, authorization failures, throttled requests and infrastructure failures must be distinguishable from one another — an operator has to be able to tell "someone is guessing passwords" from "LDAP is down" without reading the code.
+
+### Dependencies that log on their own
+
+A library that writes to the standard `log` package writes to stderr: unstructured, and unaffected by `logging.level`. That has to be redirected into the service's logger, or the promise of structured logging holds only for the records this service writes itself.
+
+`go-redis` is the case in point. Against an unreachable Redis it emits roughly three lines per operation, and nginx issues one authentication request per HTTP request — so a single page view with thirty assets produced about a hundred unparseable lines, at `logging.level: error`. Measured: five authentication requests produced twenty-five log lines, twenty of them unstructured.
+
+Its diagnostics now go through `redis.SetLogger` at debug level. Debug, because the failure is already reported where it matters — the cache error counter, and one structured record from the startup probe. What is left is per-operation detail: useful when looking for it, noise otherwise.
 
 ## 12. Security requirements
 
@@ -802,6 +814,21 @@ Native installation, three ways in: an Arch package, a release archive, or `make
 ```
 
 A package must not install or modify nginx itself. nginx is an `optdepends`, not a dependency: the service is useful without it while a configuration is being written, the nginx package needs no modification to work with it, and a package that pulls in a web server because it can be used behind one decides too much.
+
+### One installer, and the unit's path
+
+The Makefile's `install-files` target is the only place that knows the layout. The `PKGBUILD` delegates to it rather than repeating it, and the release archives ship the same tree.
+
+That is not tidiness. The unit names the binary by absolute path, and the prefix is not known until install time: a source install goes to `/usr/local` by convention and a distribution package must go to `/usr`. The first version had the path baked into the unit and a separate install sequence in the `PKGBUILD` — so the package installed cleanly to `/usr/bin` and shipped a unit pointing at `/usr/local/bin`. Every `systemctl start` would have failed on `ExecStartPre` with "No such file or directory", on every machine, and nothing in the repository was wrong enough for the compiler, the linter or any other test to notice.
+
+`install-files` rewrites both `Exec` lines to `$PREFIX/bin`. A test installs into a throwaway directory at three different prefixes and asserts the unit points at the binary that was actually placed — a real install rather than a parse, because what matters is the tree that ends up on disk.
+
+The same test file asserts the rest of the cross-file agreements, for the same reason: each of these files is consumed by a different tool on a different machine, so a mismatch between them is invisible to everything else.
+
+- The unit's `User=`/`Group=` matches the user the `sysusers` fragment creates. If they diverge, systemd refuses to start with "Failed to determine user credentials".
+- Every secret path the example configuration names is managed by the `tmpfiles` fragment. One that is not stays root-only and the service cannot read it.
+- The pepper path is the same in the install hook, the `tmpfiles` fragment and the example configuration.
+- The workflows only call `make` targets that exist, and only bundle files that exist. The release job runs once per tag; a missing file fails it after the tag is already pushed.
 
 ### What is declarative and what cannot be
 

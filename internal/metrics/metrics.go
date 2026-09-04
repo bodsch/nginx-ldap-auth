@@ -24,6 +24,7 @@ import (
 
 	"bodsch.me/nginx-ldap-auth/internal/auth"
 	"bodsch.me/nginx-ldap-auth/internal/cache"
+	"bodsch.me/nginx-ldap-auth/internal/ldap"
 	"bodsch.me/nginx-ldap-auth/internal/ratelimit"
 )
 
@@ -47,6 +48,18 @@ const (
 	ResultError        = "error"
 )
 
+// The cache backend names, as the Cache implementations report them.
+//
+// Duplicated as constants here rather than imported, because the strings are
+// what goes on the wire: a rename in internal/cache should surface as an
+// "other" bucket in the exposition and a failing test, not as a silently
+// renamed time series that breaks every existing dashboard query.
+const (
+	cacheBackendMemory   = "memory"
+	cacheBackendRedis    = "redis"
+	cacheBackendDisabled = "disabled"
+)
+
 // PolicyUnknown is recorded in place of a policy name that matched nothing.
 //
 // The received value is never used as a label. It comes from a request, and a
@@ -61,6 +74,49 @@ const PolicyUnknown = "unknown"
 // "cannot happen", and the failure mode of being wrong about that is unbounded
 // label cardinality rather than a missing data point.
 const ReasonOther = "other"
+
+// The closed sets of values each label may take.
+//
+// Every label is bounded here rather than at its call site. The values are all
+// constants in the packages that report them, so in principle this is
+// redundant — and that is exactly the assumption not worth holding: it is a
+// property of another package, this layer cannot enforce it, and the cost of
+// being wrong is not a missing data point but unbounded cardinality, which
+// takes the scrape down and every other metric with it.
+//
+// A value outside a set becomes ReasonOther rather than being dropped. A metric
+// that silently loses observations is worse than one with an "other" bucket,
+// because the bucket is visible and prompts someone to look.
+var (
+	knownOperations = closedSet(
+		ldap.OperationBind, ldap.OperationServiceBind, ldap.OperationSearch)
+
+	knownLDAPResults = closedSet(
+		ldap.ResultSuccess, ldap.ResultFailure, ldap.ResultError)
+
+	knownBackends = closedSet(cacheBackendMemory, cacheBackendRedis, cacheBackendDisabled)
+
+	knownHandlers = closedSet("auth", "healthz", "readyz")
+)
+
+// closedSet builds a lookup from the values a label may take.
+func closedSet(values ...string) map[string]struct{} {
+	set := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		set[value] = struct{}{}
+	}
+
+	return set
+}
+
+// bounded returns value if the set permits it, and ReasonOther otherwise.
+func bounded(set map[string]struct{}, value string) string {
+	if _, known := set[value]; known {
+		return value
+	}
+
+	return ReasonOther
+}
 
 // knownReasons is the closed set of reasons that may become a label value.
 var knownReasons = map[string]struct{}{
@@ -289,7 +345,9 @@ func resultFor(status auth.Status, reason string) string {
 
 // ObserveLDAP records one directory operation. It satisfies ldap.Observer.
 func (m *Metrics) ObserveLDAP(operation, result string, elapsed time.Duration) {
-	m.ldapRequests.WithLabelValues(operation, result).Inc()
+	operation = bounded(knownOperations, operation)
+
+	m.ldapRequests.WithLabelValues(operation, bounded(knownLDAPResults, result)).Inc()
 	m.ldapDuration.WithLabelValues(operation).Observe(elapsed.Seconds())
 }
 
@@ -300,6 +358,16 @@ func (m *Metrics) ObserveRedis(elapsed time.Duration) {
 
 // ObserveHTTP records one HTTP request.
 func (m *Metrics) ObserveHTTP(handler string, code int, elapsed time.Duration) {
+	handler = bounded(knownHandlers, handler)
+
+	// The code is an int, so it cannot carry an arbitrary string — but it can
+	// carry an arbitrary number. Anything outside the range HTTP defines is
+	// a bug in a handler, and one series per invented code is still
+	// unbounded cardinality.
+	if code < 100 || code > 599 {
+		code = 0
+	}
+
 	m.httpRequests.WithLabelValues(handler, strconv.Itoa(code)).Inc()
 	m.httpDuration.WithLabelValues(handler).Observe(elapsed.Seconds())
 }

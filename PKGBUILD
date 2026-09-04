@@ -61,10 +61,9 @@ build() {
   export CGO_ENABLED=0
   export GOFLAGS="-buildmode=pie -mod=readonly -modcacherw -trimpath"
 
-  go build \
-    -ldflags "-s -w -X main.version=${pkgver}-${pkgrel} -X main.buildDate=$(date -u +%Y-%m-%d)" \
-    -o "${pkgname}" \
-    ./cmd/nginx-ldap-auth
+  # Through make, so that the build flags and the version stamping have one
+  # definition rather than two that can disagree.
+  make build VERSION="${pkgver}-${pkgrel}"
 }
 
 check() {
@@ -80,21 +79,12 @@ check() {
 package() {
   cd "${pkgname}"
 
-  install -Dm0755 "${pkgname}" "${pkgdir}/usr/bin/${pkgname}"
-
-  install -Dm0644 "systemd/${pkgname}.service" "${pkgdir}/usr/lib/systemd/system/${pkgname}.service"
-  install -Dm0644 "packaging/${pkgname}.sysusers" "${pkgdir}/usr/lib/sysusers.d/${pkgname}.conf"
-  install -Dm0644 "packaging/${pkgname}.tmpfiles" "${pkgdir}/usr/lib/tmpfiles.d/${pkgname}.conf"
-
-  # The mode here is the packaged one; systemd-tmpfiles narrows it to
-  # root:nginx-ldap-auth 0640 on the target machine, because the group does not
-  # exist while this runs.
-  install -Dm0644 config.example.yaml "${pkgdir}/etc/${pkgname}/config.yaml"
-
-  install -Dm0644 nginx/auth.conf "${pkgdir}/usr/share/doc/${pkgname}/examples/auth.conf"
-  install -Dm0644 config.example.yaml "${pkgdir}/usr/share/doc/${pkgname}/config.example.yaml"
-  install -Dm0644 README.md "${pkgdir}/usr/share/doc/${pkgname}/README.md"
-  install -Dm0644 project.md "${pkgdir}/usr/share/doc/${pkgname}/project.md"
-
-  install -Dm0644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+  # Everything is installed by the Makefile. The layout has one definition, in
+  # one file, and it is exercised by a test — which a second copy of these
+  # paths here would not be. That test exists because the unit named a binary
+  # this function put somewhere else, and nothing noticed until it was run.
+  make install-files \
+    DESTDIR="${pkgdir}" \
+    PREFIX=/usr \
+    SYSCONFDIR=/etc
 }

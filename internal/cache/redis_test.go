@@ -1,8 +1,12 @@
 package cache
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"log/slog"
+	"net"
 	"os"
 	"strings"
 	"sync"
@@ -390,4 +394,106 @@ func TestParseOutcomeRoundTrip(t *testing.T) {
 	if got.Allowed() {
 		t.Error("an unknown outcome name decoded into a grant")
 	}
+}
+
+// TestRedisDiagnosticsGoThroughTheLogger is the project.md §11 promise that
+// logging is structured, applied to a dependency that does not know about it.
+//
+// go-redis logs through the standard log package, straight to stderr,
+// unstructured and unaffected by logging.level. During an outage it emits about
+// three lines per operation — and nginx issues one authentication request per
+// HTTP request, so a single page view with thirty assets produced roughly a
+// hundred lines a JSON log pipeline cannot parse, at logging.level: error.
+//
+// Measured before the fix: five authentication requests against an unreachable
+// Redis produced twenty-five log lines, twenty of them unstructured.
+func TestRedisDiagnosticsGoThroughTheLogger(t *testing.T) {
+	captured := &lockedBuffer{}
+
+	logger := slog.New(slog.NewJSONHandler(captured, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	// A port nothing is listening on, so the client library has something to
+	// complain about.
+	shared, err := NewRedis(RedisOptions{
+		Address: deadAddress(t),
+		Timeout: 500 * time.Millisecond,
+		Logger:  logger,
+	})
+	if err != nil {
+		t.Fatalf("NewRedis: %v", err)
+	}
+
+	t.Cleanup(func() { _ = shared.Close() })
+
+	// Enough attempts that the pool gives up and logs.
+	for range 3 {
+		_, _, _ = shared.Get(t.Context(), KeyPrefix+"absent")
+	}
+
+	logged := captured.String()
+
+	if logged == "" {
+		t.Fatal("the client library's diagnostics did not reach the logger; they are going to stderr")
+	}
+
+	// Every line has to be a record the logger produced, which is what makes
+	// it parseable and level-controlled.
+	for _, line := range strings.Split(strings.TrimSpace(logged), "\n") {
+		var record map[string]any
+
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			t.Fatalf("an unstructured line reached the log: %q", line)
+		}
+
+		if record["component"] != "redis" {
+			t.Errorf("record is not attributed to the client library: %s", line)
+		}
+
+		// Debug, not warn or error: the failure is already reported by
+		// the cache error counter and by the startup probe. What is left
+		// is per-operation detail.
+		if record["level"] != "DEBUG" {
+			t.Errorf("level = %v, want DEBUG: at a higher level this floods the journal during an outage",
+				record["level"])
+		}
+	}
+}
+
+// deadAddress returns a loopback address nothing is listening on.
+func deadAddress(t *testing.T) string {
+	t.Helper()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+
+	address := listener.Addr().String()
+
+	if err := listener.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	return address
+}
+
+// lockedBuffer is a bytes.Buffer that survives the client library's background
+// goroutines writing to it.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.buf.String()
 }

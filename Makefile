@@ -117,9 +117,28 @@ release: ## Cross-compile static release binaries into dist/.
 	done
 
 .PHONY: install
-install: build ## Install the binary, unit, sysusers fragment and examples.
+install: build install-files ## Build, then install everything.
+
+# Split from `install` so that a packaging recipe can install without building
+# again: makepkg builds in build() and packages in package(), and a rebuild in
+# the second is both wasted and a chance for the two to differ.
+#
+# This is the only place that knows the layout. The PKGBUILD delegates here
+# rather than repeating it, because a second copy of these paths is a copy that
+# drifts — and a unit pointing at a binary that is somewhere else installs
+# cleanly and then fails at every start.
+.PHONY: install-files
+install-files: ## Install an already-built tree (honours DESTDIR and PREFIX).
 	install -Dm0755 $(BIN_DIR)/$(BINARY) $(DESTDIR)$(PREFIX)/bin/$(BINARY)
-	install -Dm0644 systemd/$(BINARY).service $(DESTDIR)$(UNITDIR)/$(BINARY).service
+
+	# The unit names the binary by absolute path, and the prefix is not
+	# known until install time: a source install goes to /usr/local by
+	# convention, a distribution package must go to /usr. So the checked-in
+	# unit carries the source-install path and it is rewritten here.
+	sed -E 's|^(Exec[A-Za-z]*=)[^[:space:]]*/$(BINARY)|\1$(PREFIX)/bin/$(BINARY)|' \
+		systemd/$(BINARY).service > $(BIN_DIR)/$(BINARY).service
+	install -Dm0644 $(BIN_DIR)/$(BINARY).service $(DESTDIR)$(UNITDIR)/$(BINARY).service
+
 	install -Dm0644 packaging/$(BINARY).sysusers $(DESTDIR)$(SYSUSERSDIR)/$(BINARY).conf
 	install -Dm0644 packaging/$(BINARY).tmpfiles $(DESTDIR)$(TMPFILESDIR)/$(BINARY).conf
 	install -Dm0640 config.example.yaml $(DESTDIR)$(SYSCONFDIR)/$(BINARY)/config.yaml

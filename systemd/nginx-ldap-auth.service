@@ -11,6 +11,10 @@ Type=simple
 User=nginx-ldap-auth
 Group=nginx-ldap-auth
 
+# The path below is the source-install one. `make install-files` rewrites both
+# Exec lines to $PREFIX/bin, so the packaged unit points at /usr/bin — a unit
+# naming a binary that is somewhere else installs cleanly and then fails at
+# every start.
 ExecStartPre=/usr/local/bin/nginx-ldap-auth --check --config /etc/nginx-ldap-auth/config.yaml
 ExecStart=/usr/local/bin/nginx-ldap-auth --config /etc/nginx-ldap-auth/config.yaml
 

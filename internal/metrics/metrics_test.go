@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -338,4 +339,178 @@ func TestExposedLabelsCarryNoCredentialMaterial(t *testing.T) {
 			t.Errorf("the exposition carries %q:\n%s", forbidden, exposition)
 		}
 	}
+}
+
+// TestEveryLabelIsBoundedInThisLayer is the project.md §10 claim that "every
+// one of these is bounded inside the metrics layer rather than by whoever
+// calls it", asserted rather than assumed.
+//
+// It was not true when the claim was written: policy and reason were bounded,
+// operation, result, handler and backend were taken from the caller verbatim.
+// All six are constants in the packages that report them, so nothing was
+// actually broken — but that is a property of another package, this layer
+// cannot enforce it, and the cost of being wrong is not a missing data point.
+// It is unbounded cardinality, which takes the scrape down and every other
+// metric with it.
+func TestEveryLabelIsBoundedInThisLayer(t *testing.T) {
+	m := newTestMetrics(t)
+
+	hostile := "../../etc/passwd-" + strings.Repeat("x", 300)
+
+	if err := m.RegisterState(hostileNameCache{}, ratelimit.Disabled{}); err != nil {
+		t.Fatalf("RegisterState: %v", err)
+	}
+
+	m.ObserveAuth(hostile, auth.StatusAllow, hostile, time.Millisecond)
+	m.ObserveLDAP(hostile, hostile, time.Millisecond)
+	m.ObserveHTTP(hostile, 200, time.Millisecond)
+
+	exposition := scrape(t, m)
+
+	if strings.Contains(exposition, "etc/passwd") {
+		t.Errorf("an unbounded label value reached the exposition:\n%s", exposition)
+	}
+
+	// Every one of them must have landed in a bucket that exists, so the
+	// observation is visible rather than silently dropped.
+	for _, want := range []string{
+		`policy="` + PolicyUnknown + `"`,
+		`reason="` + ReasonOther + `"`,
+		`operation="` + ReasonOther + `"`,
+		`handler="` + ReasonOther + `"`,
+		`backend="` + ReasonOther + `"`,
+	} {
+		if !strings.Contains(exposition, want) {
+			t.Errorf("missing %s; the observation was dropped rather than bucketed:\n%s", want, exposition)
+		}
+	}
+}
+
+// hostileNameCache reports a backend name no dashboard should ever see.
+type hostileNameCache struct{ cache.Disabled }
+
+func (hostileNameCache) Name() string {
+	return "../../etc/passwd-" + strings.Repeat("x", 300)
+}
+
+// TestOutOfRangeHTTPCodeIsBucketed: the code is an int, so it cannot carry a
+// string — but a handler bug can make it carry an arbitrary number, and one
+// series per invented code is the same cardinality problem.
+func TestOutOfRangeHTTPCodeIsBucketed(t *testing.T) {
+	m := newTestMetrics(t)
+
+	for _, code := range []int{0, -1, 99, 600, 999999} {
+		m.ObserveHTTP("auth", code, time.Millisecond)
+	}
+
+	exposition := scrape(t, m)
+
+	for _, unwanted := range []string{`code="600"`, `code="999999"`, `code="-1"`, `code="99"`} {
+		if strings.Contains(exposition, unwanted) {
+			t.Errorf("an out-of-range status code became a series: %s", unwanted)
+		}
+	}
+
+	if !strings.Contains(exposition, `code="0"`) {
+		t.Errorf("out-of-range codes were dropped rather than bucketed:\n%s", exposition)
+	}
+}
+
+// TestBackendNamesMatchTheCacheImplementations guards the constants this layer
+// duplicates.
+//
+// They are duplicated on purpose: the strings are what goes on the wire, so a
+// rename in internal/cache has to surface as a failing test here rather than as
+// a silently renamed time series that breaks every dashboard query. This is the
+// test that makes that true.
+func TestBackendNamesMatchTheCacheImplementations(t *testing.T) {
+	memory, err := cache.NewMemory(1)
+	if err != nil {
+		t.Fatalf("cache.NewMemory: %v", err)
+	}
+
+	shared, err := cache.NewRedis(cache.RedisOptions{Address: "127.0.0.1:1", Timeout: time.Second})
+	if err != nil {
+		t.Fatalf("cache.NewRedis: %v", err)
+	}
+
+	t.Cleanup(func() { _ = shared.Close() })
+
+	for want, backend := range map[string]cache.Cache{
+		cacheBackendMemory:   memory,
+		cacheBackendRedis:    shared,
+		cacheBackendDisabled: cache.Disabled{},
+	} {
+		if got := backend.Name(); got != want {
+			t.Errorf("cache reports %q, this layer expects %q; the label set is out of date", got, want)
+		}
+	}
+}
+
+// TestConcurrentObservationDuringScrape is meaningful under -race.
+//
+// The state collector reads the cache's and the throttle's counters while
+// requests are mutating them, and a scrape can land at any moment. This is the
+// normal case in production, not an edge case: Prometheus scrapes on a timer
+// and nginx authenticates on every request.
+func TestConcurrentObservationDuringScrape(t *testing.T) {
+	m := newTestMetrics(t)
+
+	memory, err := cache.NewMemory(32)
+	if err != nil {
+		t.Fatalf("cache.NewMemory: %v", err)
+	}
+
+	throttle, err := ratelimit.New(ratelimit.Config{
+		Window:                time.Minute,
+		BlockDuration:         time.Minute,
+		MaxFailuresPerUser:    5,
+		MaxFailuresPerAddress: 0,
+		MaxEntries:            32,
+	})
+	if err != nil {
+		t.Fatalf("ratelimit.New: %v", err)
+	}
+
+	if err := m.RegisterState(memory, throttle); err != nil {
+		t.Fatalf("RegisterState: %v", err)
+	}
+
+	ctx := t.Context()
+
+	var wg sync.WaitGroup
+
+	for worker := range 4 {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			for i := range 100 {
+				m.ObserveAuth("intranet", auth.StatusAllow, "authenticated", time.Millisecond)
+				m.ObserveLDAP("bind", "success", time.Millisecond)
+				m.ObserveHTTP("auth", 200, time.Millisecond)
+
+				key := fmt.Sprintf("k%d", i%8)
+
+				if err := memory.Set(ctx, key, cache.Decision{Outcome: cache.OutcomeAllow}, time.Minute); err != nil {
+					t.Errorf("Set: %v", err)
+
+					return
+				}
+
+				memory.Get(ctx, key) //nolint:errcheck // the value is not what this test is about
+				throttle.RecordFailure(fmt.Sprintf("user%d", worker), "10.0.0.1")
+			}
+		}()
+	}
+
+	// Scrape while all of that is in flight.
+	for range 20 {
+		scrape(t, m)
+	}
+
+	wg.Wait()
+
+	scrape(t, m)
 }

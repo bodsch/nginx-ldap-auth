@@ -371,3 +371,207 @@ func waitForHTTP(t *testing.T, url string) string {
 		time.Sleep(5 * time.Millisecond)
 	}
 }
+
+// TestMetricsListenerFailureBringsTheServiceDown is the promise in
+// runListeners, and it is the "partial success" failure mode.
+//
+// A service whose authentication listener bound but whose metrics listener did
+// not would answer every request and be invisible to monitoring — and the gap
+// would be invisible precisely in the system that would have reported it. So
+// the first listener failure has to bring the process down, loudly, at start.
+//
+// The address is occupied for the duration of the test, which is the realistic
+// cause: a stale instance, or a port already taken by something else.
+func TestMetricsListenerFailureBringsTheServiceDown(t *testing.T) {
+	occupied, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+
+	defer func() { _ = occupied.Close() }()
+
+	path := metricsConfig(t, freeAddress(t), occupied.Addr().String())
+
+	cfg, _, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+
+	done := make(chan error, 1)
+
+	go func() { done <- serve(t.Context(), cfg, slog.New(slog.NewTextHandler(io.Discard, nil))) }()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("serve returned nil: the service would run unmonitored and look healthy")
+		}
+
+		if !strings.Contains(err.Error(), occupied.Addr().String()) {
+			t.Errorf("err = %v, want it to name the address that could not be bound", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("serve kept running with a metrics listener that never bound; " +
+			"systemd would report the unit as started and monitoring would silently have no data")
+	}
+}
+
+// TestUnreachableSharedCacheDoesNotRefuseStartup is the project.md §6 promise.
+//
+// The cost of a Redis outage is LDAP binds. Refusing to start over it would
+// turn a cache outage into a site outage — every protected location behind this
+// service would return 500 because the thing that was supposed to make it
+// faster is down.
+func TestUnreachableSharedCacheDoesNotRefuseStartup(t *testing.T) {
+	authAddress := freeAddress(t)
+
+	// A port nothing is listening on. Redis' own default is deliberately
+	// avoided: a developer running a real Redis would otherwise turn this
+	// test into a no-op.
+	dead := freeAddress(t)
+
+	path := redisConfig(t, authAddress, freeAddress(t), dead)
+
+	cfg, _, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+
+	done := make(chan error, 1)
+
+	go func() { done <- serve(ctx, cfg, slog.New(slog.NewTextHandler(io.Discard, nil))) }()
+
+	t.Cleanup(func() {
+		cancel()
+
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Error("serve did not return after its context was cancelled")
+		}
+	})
+
+	// The service has to come up and answer. It falls through to the
+	// directory on every request, which is slower and entirely correct.
+	waitForHTTP(t, "http://"+authAddress+"/healthz")
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+authAddress+"/auth", nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("the authentication endpoint is not answering with the cache down: %v", err)
+	}
+
+	defer func() { _ = resp.Body.Close() }()
+
+	// No credentials, so a challenge — which proves the request reached the
+	// authentication path rather than dying on the cache.
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", resp.StatusCode)
+	}
+
+	if resp.Header.Get("WWW-Authenticate") == "" {
+		t.Error("no challenge, so the request did not reach the authentication path")
+	}
+}
+
+// redisConfig writes a configuration with the shared cache enabled.
+func redisConfig(t *testing.T, listen, metricsAddress, redisAddress string) string {
+	t.Helper()
+
+	dir := t.TempDir()
+
+	pepper := filepath.Join(dir, "pepper.secret")
+	if err := os.WriteFile(pepper, []byte(strings.Repeat("p", 64)), 0o600); err != nil {
+		t.Fatalf("write pepper: %v", err)
+	}
+
+	path := filepath.Join(dir, "config.yaml")
+
+	body := fmt.Sprintf(`
+server:
+  listen: %s
+default_policy: intranet
+policies:
+  intranet:
+    realm: "Intranet"
+    ldap: primary
+    allow_any_user: true
+ldap:
+  primary:
+    url: ldaps://127.0.0.1:636
+    base_dn: dc=example,dc=org
+    operation_timeout: 5s
+cache:
+  enabled: true
+  pepper_file: %s
+redis:
+  enabled: true
+  address: %s
+  timeout: 1s
+metrics:
+  enabled: true
+  address: %s
+`, listen, pepper, redisAddress, metricsAddress)
+
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	return path
+}
+
+// TestWarningsAreNotDuplicated: every warning appeared twice — once as plain
+// text on stderr and once as a log record — so an operator reading the journal
+// saw each configuration problem reported two ways and had to work out that
+// they were the same one.
+//
+// Plain text is for the reader who has no log pipeline: --check at a terminal,
+// and a load that failed before a logger existed. Everywhere else the
+// structured record is the only copy.
+func TestWarningsAreNotDuplicated(t *testing.T) {
+	dir := t.TempDir()
+
+	pepper := filepath.Join(dir, "pepper.secret")
+	if err := os.WriteFile(pepper, []byte(strings.Repeat("p", 64)), 0o600); err != nil {
+		t.Fatalf("write pepper: %v", err)
+	}
+
+	path := filepath.Join(dir, "config.yaml")
+
+	// tls.verify: false produces exactly one warning.
+	body := fmt.Sprintf(`
+policies:
+  intranet:
+    realm: "Intranet"
+    ldap: primary
+    allow_any_user: true
+ldap:
+  primary:
+    url: ldaps://127.0.0.1:636
+    base_dn: dc=example,dc=org
+    tls:
+      verify: false
+cache:
+  enabled: true
+  pepper_file: %s
+`, pepper)
+
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	_, stderr, err := invoke(t, "--check", "--config", path)
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	if count := strings.Count(stderr, "tls.verify is false"); count != 1 {
+		t.Errorf("the warning appears %d times on stderr, want once:\n%s", count, stderr)
+	}
+}
