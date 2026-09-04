@@ -1,0 +1,160 @@
+# nginx-ldap-auth configuration.
+#
+# Copy to /etc/nginx-ldap-auth/config.yaml and adjust. Every key shown here has
+# the value the service uses when it is omitted, unless marked otherwise, so a
+# working configuration can be much shorter than this file.
+#
+# Check a file without starting the service:
+#   nginx-ldap-auth --check --config /etc/nginx-ldap-auth/config.yaml
+
+server:
+  # Loopback only. The authentication endpoint must not be reachable by
+  # clients: it is a password oracle against the directory, and it trusts the
+  # client address header below.
+  listen: 127.0.0.1:8080
+
+  # Header carrying the real client address. Behind nginx every request comes
+  # from the proxy, so without this the per-address throttle counts the whole
+  # internet as one client. nginx has to set it:
+  #   proxy_set_header X-Real-IP $remote_addr;
+  # Clear it to fall back to the peer address.
+  client_ip_header: X-Real-IP
+
+  read_timeout: 5s
+  write_timeout: 5s
+  idle_timeout: 30s
+  shutdown_timeout: 10s
+  max_header_bytes: 8192
+
+# Selected when a request carries no X-Auth-Policy header. Leave it out to
+# require every nginx location to name its policy explicitly.
+default_policy: intranet
+
+# A policy is what lets one instance serve several applications: it bundles the
+# realm, the directory and the authorization rules that apply to one of them.
+policies:
+  intranet:
+    realm: "Intranet"
+    ldap: primary
+
+    # Access requires membership in at least one of these. Both the full DN and
+    # the short name are accepted, and both are compared case-insensitively.
+    require_groups:
+      - cn=web-users,ou=groups,dc=example,dc=org
+
+  monitoring:
+    realm: "Monitoring"
+    ldap: primary
+    require_groups:
+      - cn=ops,ou=groups,dc=example,dc=org
+
+  # Authentication without authorization has to be stated, so that it cannot
+  # happen by forgetting require_groups.
+  # staging:
+  #   realm: "Staging"
+  #   ldap: primary
+  #   allow_any_user: true
+
+ldap:
+  primary:
+    url: ldaps://glauth.example.org:636
+    base_dn: dc=example,dc=org
+
+    # Exactly one %s, filled with the escaped login name.
+    user_filter: "(uid=%s)"
+
+    # The attribute holding the canonical login name. Its value, not what the
+    # client typed, is what reaches the upstream application.
+    user_attribute: uid
+
+    # Group resolution. Use group_filter for member/memberUid schemas, or
+    # group_attribute for memberOf schemas — one or the other, never both.
+    group_base_dn: ou=groups,dc=example,dc=org
+    group_filter: "(&(objectClass=posixGroup)(memberUid=%s))"
+
+    # What %s in group_filter is filled with: "user" or "dn".
+    group_filter_value: user
+
+    # The attribute reported as the group's name.
+    group_name_attribute: cn
+
+    # memberOf style alternative:
+    # group_attribute: memberOf
+
+    # Service account for the user and group searches. Both keys or neither;
+    # neither means anonymous search.
+    bind_dn: cn=serviceuser,dc=example,dc=org
+    bind_password_file: /etc/nginx-ldap-auth/ldap-bind.secret
+
+    bind_timeout: 5s
+    operation_timeout: 5s
+
+    tls:
+      # Defaults to true. Setting it to false accepts any certificate, which
+      # means anyone able to intercept the connection can collect credentials.
+      verify: true
+
+      # For a directory using a private CA.
+      # ca_file: /etc/ssl/certs/internal-ca.pem
+
+      # Upgrade a plaintext ldap:// connection. Not for ldaps://, which is
+      # already TLS from the first byte.
+      # start_tls: false
+
+cache:
+  # nginx issues one authentication request per HTTP request, including every
+  # static asset. Without the cache a single page view becomes dozens of LDAP
+  # binds.
+  enabled: true
+  ttl: 60s
+
+  # Caching failures reduces the load a brute-force attempt puts on the
+  # directory, but it also delays a corrected password. Off by default.
+  negative_ttl: 0s
+
+  # Bounds the cache. This stops a spray of invalid usernames from growing the
+  # process, so it is a security control and not only a memory setting.
+  max_entries: 10000
+
+  # Keys the HMAC that derives cache keys from credentials. Required while the
+  # cache is enabled: an unkeyed hash of a password is crackable offline.
+  # Generate once, keep out of backups that travel:
+  #   openssl rand -hex 32 > /etc/nginx-ldap-auth/cache-pepper.secret
+  #   chmod 0640 /etc/nginx-ldap-auth/cache-pepper.secret
+  pepper_file: /etc/nginx-ldap-auth/cache-pepper.secret
+
+# Shared cache for several instances. Not implemented yet (milestone 2);
+# enabling it refuses startup rather than silently caching per process.
+redis:
+  enabled: false
+  address: 127.0.0.1:6379
+  database: 3
+  timeout: 2s
+
+# Failure throttle. Counts failures per username and per source address, and
+# answers 429 without touching the directory once a limit is reached.
+#
+# This is not a replacement for limit_req in nginx: nginx limits request volume
+# per address, this limits failures per identity.
+rate_limit:
+  enabled: true
+  window: 1m
+  max_failures_per_user: 10
+  max_failures_per_ip: 30
+  block_duration: 5m
+  max_entries: 10000
+
+logging:
+  # debug logs every successful authentication, which on a busy site is one
+  # line per HTTP request.
+  level: info
+  format: json
+
+  # Login names in log records. Needed to investigate a lockout; turn off if
+  # the journal is readable by people who should not see them.
+  log_username: true
+
+# Not implemented yet (milestone 2). Enabling it logs a warning and is ignored.
+metrics:
+  enabled: false
+  address: 127.0.0.1:9931

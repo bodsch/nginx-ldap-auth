@@ -1,0 +1,10 @@
+# The replaced original stays local.
+original
+
+# Build artefacts
+bin
+dist
+coverage.out
+
+# The fuzz corpus with found cases is kept, the cache is not
+testdata/fuzz/*/[0-9a-f]*

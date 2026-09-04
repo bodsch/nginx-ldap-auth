@@ -1,0 +1,47 @@
+# golangci-lint v2 configuration.
+#
+# On top of the v2 default linters (errcheck, govet, ineffassign, staticcheck,
+# unused) this enables:
+#   - gosec:     security anti-patterns. This service exists to make an
+#                authentication decision, so the class of finding gosec reports
+#                is the class of bug that matters most here.
+#   - bodyclose: every HTTP response body must be closed
+#   - misspell:  doc/comment typos
+#
+# Security scanning also runs out-of-band via `make vuln` (govulncheck).
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  enable:
+    - gosec
+    - bodyclose
+    - misspell
+  settings:
+    errcheck:
+      exclude-functions:
+        # Writes to stdout/stderr or to a ResponseWriter: there is nowhere left
+        # to report a failure to.
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln
+        # Deferred Close on a connection or listener the code has already
+        # finished with. For the LDAP connections this is deliberate: a close
+        # error cannot change an authentication decision that has already been
+        # made, and the connection is being discarded either way.
+        - (io.Closer).Close
+        - (io.ReadCloser).Close
+        - (net.Conn).Close
+        - (net.Listener).Close
+        - (*crypto/tls.Conn).Close
+        - (*github.com/go-ldap/ldap/v3.Conn).Close
+  exclusions:
+    rules:
+      # Test fixtures do things gosec flags on purpose — generating keys with
+      # short parameters, pointing at unreachable addresses, writing files with
+      # loose modes to check that the loader warns about them.
+      - path: _test\.go
+        linters:
+          - gosec

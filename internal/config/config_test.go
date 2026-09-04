@@ -1,0 +1,425 @@
+package config
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+// writeFile puts content at a path under the test's temporary directory and
+// returns the absolute path.
+func writeFile(t *testing.T, name, content string, mode os.FileMode) string {
+	t.Helper()
+
+	path := filepath.Join(t.TempDir(), name)
+
+	if err := os.WriteFile(path, []byte(content), mode); err != nil {
+		t.Fatalf("write %s: %v", name, err)
+	}
+
+	return path
+}
+
+// loadYAML writes a configuration file and loads it.
+func loadYAML(t *testing.T, yaml string) (*Config, []string, error) {
+	t.Helper()
+
+	return Load(writeFile(t, "config.yaml", yaml, 0o600))
+}
+
+func TestLoadAppliesDefaults(t *testing.T) {
+	cfg, warnings, err := loadYAML(t, `
+policies:
+  intranet:
+    ldap: primary
+    allow_any_user: true
+ldap:
+  primary:
+    url: ldaps://dir.example.org:636
+    base_dn: dc=example,dc=org
+cache:
+  enabled: false
+`)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if cfg.Server.Listen != "127.0.0.1:8080" {
+		t.Errorf("server.listen = %q, want the loopback default", cfg.Server.Listen)
+	}
+
+	if cfg.Server.ReadTimeout.Duration() != 5*time.Second {
+		t.Errorf("server.read_timeout = %s, want 5s", cfg.Server.ReadTimeout)
+	}
+
+	if got := cfg.Policies["intranet"].Realm; got != "Restricted" {
+		t.Errorf("policy realm = %q, want the default", got)
+	}
+
+	if got := cfg.Policies["intranet"].Name; got != "intranet" {
+		t.Errorf("policy name = %q, want it copied from the map key", got)
+	}
+
+	dir := cfg.LDAP["primary"]
+
+	if dir.UserFilter != "(uid=%s)" {
+		t.Errorf("user_filter = %q, want the default", dir.UserFilter)
+	}
+
+	if dir.GroupSource != GroupSourceNone {
+		t.Errorf("group_source = %q, want %q when neither filter nor attribute is set",
+			dir.GroupSource, GroupSourceNone)
+	}
+
+	if !dir.TLS.VerifyCertificate() {
+		t.Error("tls.verify defaulted to false; an omitted key must not disable certificate validation")
+	}
+
+	if !cfg.Logging.LogUsername {
+		t.Error("logging.log_username defaulted to false, want true")
+	}
+
+	// The cache is off in this fixture, which is worth saying out loud but
+	// is not an error.
+	if len(warnings) == 0 {
+		t.Error("expected a warning about the disabled cache")
+	}
+}
+
+// TestExplicitTLSVerifyFalseSurvives is a regression test.
+//
+// tls.verify defaults to true, and a map entry's defaults cannot be pre-filled.
+// An earlier version normalised an absent block by setting Verify to true when
+// it was false — which silently re-enabled verification for anyone who had
+// deliberately turned it off, and made the startup warning disappear with it.
+func TestExplicitTLSVerifyFalseSurvives(t *testing.T) {
+	cfg, warnings, err := loadYAML(t, `
+policies:
+  intranet:
+    ldap: primary
+    allow_any_user: true
+ldap:
+  primary:
+    url: ldaps://dir.example.org:636
+    base_dn: dc=example,dc=org
+    tls:
+      verify: false
+cache:
+  enabled: false
+`)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if cfg.LDAP["primary"].TLS.VerifyCertificate() {
+		t.Fatal("an explicit tls.verify: false was overwritten with true")
+	}
+
+	if !containsSubstring(warnings, "tls.verify is false") {
+		t.Errorf("expected a warning naming the disabled verification, got %q", warnings)
+	}
+}
+
+func TestLoadRejectsUnknownField(t *testing.T) {
+	_, _, err := loadYAML(t, "server:\n  listne: 127.0.0.1:8080\n")
+	if err == nil {
+		t.Fatal("expected a misspelled key to be rejected")
+	}
+
+	if !strings.Contains(err.Error(), "listne") {
+		t.Errorf("error does not name the offending key: %v", err)
+	}
+}
+
+func TestGroupSourceInference(t *testing.T) {
+	tests := map[string]struct {
+		directory string
+		want      string
+	}{
+		"filter": {
+			directory: `
+    group_base_dn: ou=groups,dc=example,dc=org
+    group_filter: "(memberUid=%s)"`,
+			want: GroupSourceFilter,
+		},
+		"attribute": {
+			directory: "\n    group_attribute: memberOf",
+			want:      GroupSourceAttribute,
+		},
+		"none": {
+			directory: "",
+			want:      GroupSourceNone,
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			cfg, _, err := loadYAML(t, `
+policies:
+  intranet:
+    ldap: primary
+    allow_any_user: true
+ldap:
+  primary:
+    url: ldaps://dir.example.org:636
+    base_dn: dc=example,dc=org`+test.directory+`
+cache:
+  enabled: false
+`)
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+
+			if got := cfg.LDAP["primary"].GroupSource; got != test.want {
+				t.Errorf("group_source = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestValidationRejects(t *testing.T) {
+	base := func(body string) string {
+		return body + "\ncache:\n  enabled: false\n"
+	}
+
+	tests := map[string]struct {
+		yaml string
+		want string
+	}{
+		"policy without authorization decision": {
+			yaml: base(`
+policies:
+  intranet:
+    ldap: primary
+ldap:
+  primary:
+    url: ldaps://dir.example.org:636
+    base_dn: dc=example,dc=org`),
+			want: "authorizes nobody and everybody at once",
+		},
+		"require_groups together with allow_any_user": {
+			yaml: base(`
+policies:
+  intranet:
+    ldap: primary
+    allow_any_user: true
+    require_groups: [admins]
+ldap:
+  primary:
+    url: ldaps://dir.example.org:636
+    base_dn: dc=example,dc=org
+    group_attribute: memberOf`),
+			want: "would make the group check pointless",
+		},
+		"require_groups without a group source": {
+			yaml: base(`
+policies:
+  intranet:
+    ldap: primary
+    require_groups: [admins]
+ldap:
+  primary:
+    url: ldaps://dir.example.org:636
+    base_dn: dc=example,dc=org`),
+			want: "resolves no groups",
+		},
+		"policy referencing an unconfigured directory": {
+			yaml: base(`
+policies:
+  intranet:
+    ldap: elsewhere
+    allow_any_user: true
+ldap:
+  primary:
+    url: ldaps://dir.example.org:636
+    base_dn: dc=example,dc=org`),
+			want: `is not a configured directory`,
+		},
+		"unknown default policy": {
+			yaml: base(`
+default_policy: nope
+policies:
+  intranet:
+    ldap: primary
+    allow_any_user: true
+ldap:
+  primary:
+    url: ldaps://dir.example.org:636
+    base_dn: dc=example,dc=org`),
+			want: "is not a configured policy",
+		},
+		"plaintext ldap without StartTLS": {
+			yaml: base(`
+policies:
+  intranet:
+    ldap: primary
+    allow_any_user: true
+ldap:
+  primary:
+    url: ldap://dir.example.org:389
+    base_dn: dc=example,dc=org`),
+			want: "would send credentials in the clear",
+		},
+		"StartTLS on an ldaps URL": {
+			yaml: base(`
+policies:
+  intranet:
+    ldap: primary
+    allow_any_user: true
+ldap:
+  primary:
+    url: ldaps://dir.example.org:636
+    base_dn: dc=example,dc=org
+    tls:
+      start_tls: true`),
+			want: "cannot be used with an ldaps:// URL",
+		},
+		"trusted client address header on a public listener": {
+			yaml: base(`
+server:
+  listen: 0.0.0.0:8080
+policies:
+  intranet:
+    ldap: primary
+    allow_any_user: true
+ldap:
+  primary:
+    url: ldaps://dir.example.org:636
+    base_dn: dc=example,dc=org`),
+			want: "forge its own source address",
+		},
+		"no policies": {
+			yaml: base(`
+ldap:
+  primary:
+    url: ldaps://dir.example.org:636
+    base_dn: dc=example,dc=org`),
+			want: "no policy configured",
+		},
+		"redis is not implemented": {
+			yaml: base(`
+redis:
+  enabled: true
+policies:
+  intranet:
+    ldap: primary
+    allow_any_user: true
+ldap:
+  primary:
+    url: ldaps://dir.example.org:636
+    base_dn: dc=example,dc=org`),
+			want: "not implemented yet",
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			_, _, err := loadYAML(t, test.yaml)
+			if err == nil {
+				t.Fatalf("expected the configuration to be refused, want an error naming %q", test.want)
+			}
+
+			if !strings.Contains(err.Error(), test.want) {
+				t.Errorf("error does not explain the problem\n got: %v\nwant substring: %q", err, test.want)
+			}
+		})
+	}
+}
+
+// TestValidationReportsEveryProblem checks that fixing a configuration takes
+// one pass, not one restart per mistake.
+func TestValidationReportsEveryProblem(t *testing.T) {
+	_, _, err := loadYAML(t, `
+logging:
+  level: verbose
+  format: yaml
+policies:
+  intranet:
+    ldap: primary
+    allow_any_user: true
+ldap:
+  primary:
+    url: ldaps://dir.example.org:636
+    base_dn: "not a dn"
+cache:
+  enabled: false
+`)
+	if err == nil {
+		t.Fatal("expected the configuration to be refused")
+	}
+
+	for _, want := range []string{"logging.level", "logging.format", "base_dn"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error omits %q, so it would take another restart to find:\n%v", want, err)
+		}
+	}
+}
+
+func TestFilterTemplateValidation(t *testing.T) {
+	valid := []string{
+		"(uid=%s)",
+		"(&(objectClass=posixAccount)(uid=%s))",
+		"(&(objectClass=posixGroup)(memberUid=%s))",
+	}
+
+	invalid := map[string]string{
+		"":            "must be set",
+		"uid=%s":      "not a parenthesised LDAP filter",
+		"(uid=alice)": "expected exactly one placeholder",
+		"(uid=%v)":    "uses a placeholder other than %s",
+		"(%s)":        "where an attribute name belongs",
+		"(uid=100%%)": "contains 2 % signs",
+		// Two placeholders would leave the second as %!s(MISSING) in the
+		// filter that is actually sent.
+		"(|(uid=%s)(mail=%s))": "contains 2 % signs",
+	}
+
+	for _, filter := range valid {
+		if err := validateFilterTemplate(filter); err != nil {
+			t.Errorf("validateFilterTemplate(%q) = %v, want no error", filter, err)
+		}
+	}
+
+	for filter, want := range invalid {
+		err := validateFilterTemplate(filter)
+		if err == nil {
+			t.Errorf("validateFilterTemplate(%q) accepted the template, want an error naming %q", filter, want)
+
+			continue
+		}
+
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("validateFilterTemplate(%q) = %v, want substring %q", filter, err, want)
+		}
+	}
+}
+
+func TestPolicyNameCharset(t *testing.T) {
+	// The name arrives in a header and becomes a metric label, so the
+	// character set is deliberately narrow.
+	rejected := []string{"bad name", "with/slash", "-leading-dash", "with\"quote", strings.Repeat("x", 65)}
+
+	for _, name := range rejected {
+		if policyNamePattern.MatchString(name) {
+			t.Errorf("policy name %q was accepted", name)
+		}
+	}
+
+	for _, name := range []string{"intranet", "web-2", "a.b_c", "X"} {
+		if !policyNamePattern.MatchString(name) {
+			t.Errorf("policy name %q was rejected", name)
+		}
+	}
+}
+
+func containsSubstring(values []string, want string) bool {
+	for _, value := range values {
+		if strings.Contains(value, want) {
+			return true
+		}
+	}
+
+	return false
+}

@@ -1,0 +1,59 @@
+[Unit]
+Description=nginx LDAP Authentication Service
+Documentation=https://git.boone-schulz.de/go/nginx-ldap-auth
+# network.target, not network-online.target: the service listens on loopback
+# and connects to the directory lazily on the first request, so waiting for
+# full network configuration only slows boot.
+After=network.target
+
+[Service]
+Type=simple
+User=nginx-ldap-auth
+Group=nginx-ldap-auth
+
+ExecStartPre=/usr/local/bin/nginx-ldap-auth --check --config /etc/nginx-ldap-auth/config.yaml
+ExecStart=/usr/local/bin/nginx-ldap-auth --config /etc/nginx-ldap-auth/config.yaml
+
+Restart=on-failure
+RestartSec=2s
+
+# An invalid configuration is refused by --check above, so a restart loop here
+# would be pointless. Give up instead of hammering.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# Hardening. Verify the result with:
+#   systemd-analyze security nginx-ldap-auth.service
+NoNewPrivileges=true
+# Empty: the listen port is above 1024, so no capability is needed at all.
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectProc=invisible
+ProcSubset=pid
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+# AF_UNIX stays in: it is what journal logging uses, and what the planned
+# Unix-socket listener will need.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+# Safe for a CGO_ENABLED=0 Go binary. Breaks if cgo or a JIT is introduced.
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+ReadOnlyPaths=/etc/nginx-ldap-auth
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
