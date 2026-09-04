@@ -105,12 +105,20 @@ type Cache interface {
 }
 
 // Stats are the cache's lifetime counters plus its current size.
+//
+// The counters are monotonic, which is what lets the metrics layer read them at
+// scrape time instead of maintaining a second copy. Two counters for one fact
+// are two counters that can drift.
 type Stats struct {
 	Entries   int
 	Hits      uint64
 	Misses    uint64
 	Evictions uint64
 	Expired   uint64
+
+	// Errors counts lookups the backend could not answer. The in-process
+	// cache never increments it; a network-backed one will.
+	Errors uint64
 }
 
 // Disabled is a Cache that stores nothing.

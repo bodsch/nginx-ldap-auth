@@ -154,7 +154,12 @@ logging:
   # the journal is readable by people who should not see them.
   log_username: true
 
-# Not implemented yet (milestone 2). Enabling it logs a warning and is ignored.
+# Prometheus/OpenMetrics exposition, on its own listener so that it can be
+# firewalled separately from the authentication endpoint: nginx needs one of
+# them, the monitoring system needs the other, and those are different sets.
+#
+# The exposition names your policies and carries failure counts. Keep it on
+# loopback, or reachable from the monitoring network only.
 metrics:
-  enabled: false
+  enabled: true
   address: 127.0.0.1:9931

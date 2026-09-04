@@ -9,10 +9,11 @@ import (
 	"log/slog"
 	"net"
 	"net/url"
+	"time"
 
 	goldap "github.com/go-ldap/ldap/v3"
 
-	"git.boone-schulz.de/go/nginx-ldap-auth/internal/config"
+	"bodsch.me/nginx-ldap-auth/internal/config"
 )
 
 // withService runs fn on the pooled service-account connection.
@@ -78,7 +79,13 @@ func (c *Client) ensureService() (*goldap.Conn, error) {
 	// empty password instead would be an unauthenticated bind — the exact
 	// operation this service refuses to perform on a user's behalf.
 	if c.cfg.BindDN != "" {
-		if err := conn.Bind(c.cfg.BindDN, c.cfg.BindPassword); err != nil {
+		started := time.Now()
+
+		err := conn.Bind(c.cfg.BindDN, c.cfg.BindPassword)
+
+		c.observe(OperationServiceBind, started, err)
+
+		if err != nil {
 			_ = conn.Close()
 
 			return nil, fmt.Errorf("bind as service account %s: %w", c.cfg.BindDN, err)

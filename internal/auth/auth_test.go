@@ -11,11 +11,11 @@ import (
 	"testing"
 	"time"
 
-	"git.boone-schulz.de/go/nginx-ldap-auth/internal/cache"
-	"git.boone-schulz.de/go/nginx-ldap-auth/internal/config"
-	"git.boone-schulz.de/go/nginx-ldap-auth/internal/ldap"
-	"git.boone-schulz.de/go/nginx-ldap-auth/internal/policy"
-	"git.boone-schulz.de/go/nginx-ldap-auth/internal/ratelimit"
+	"bodsch.me/nginx-ldap-auth/internal/cache"
+	"bodsch.me/nginx-ldap-auth/internal/config"
+	"bodsch.me/nginx-ldap-auth/internal/ldap"
+	"bodsch.me/nginx-ldap-auth/internal/policy"
+	"bodsch.me/nginx-ldap-auth/internal/ratelimit"
 )
 
 // fakeDirectory answers on command and counts how often it was asked.

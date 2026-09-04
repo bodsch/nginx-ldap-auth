@@ -3,10 +3,11 @@ package ldap
 import (
 	"errors"
 	"fmt"
+	"time"
 
 	goldap "github.com/go-ldap/ldap/v3"
 
-	"git.boone-schulz.de/go/nginx-ldap-auth/internal/config"
+	"bodsch.me/nginx-ldap-auth/internal/config"
 )
 
 // ErrTooManyGroups means the group search hit its size limit.
@@ -50,6 +51,8 @@ func (c *Client) groupsFromFilter(identity *Identity) ([]Group, error) {
 
 	var entries []*goldap.Entry
 
+	started := time.Now()
+
 	err := c.withService(func(conn *goldap.Conn) error {
 		result, err := conn.Search(
 			c.searchRequest(c.cfg.GroupBaseDN, filter, []string{c.cfg.GroupNameAttribute}, maxGroupEntries))
@@ -61,6 +64,8 @@ func (c *Client) groupsFromFilter(identity *Identity) ([]Group, error) {
 
 		return nil
 	})
+
+	c.observe(OperationSearch, started, err)
 
 	// Truncating instead would be worse than failing. The dropped entries
 	// could include the one group the policy requires, and the user would

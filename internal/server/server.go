@@ -16,10 +16,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"git.boone-schulz.de/go/nginx-ldap-auth/internal/auth"
-	"git.boone-schulz.de/go/nginx-ldap-auth/internal/cache"
-	"git.boone-schulz.de/go/nginx-ldap-auth/internal/config"
-	"git.boone-schulz.de/go/nginx-ldap-auth/internal/ratelimit"
+	"bodsch.me/nginx-ldap-auth/internal/auth"
+	"bodsch.me/nginx-ldap-auth/internal/cache"
+	"bodsch.me/nginx-ldap-auth/internal/config"
+	"bodsch.me/nginx-ldap-auth/internal/ratelimit"
 )
 
 // Paths served by the service.
@@ -37,6 +37,7 @@ type Server struct {
 
 	cache    cache.Cache
 	throttle ratelimit.Throttle
+	observer Observer
 
 	// logUsername mirrors logging.log_username.
 	logUsername bool
@@ -64,6 +65,10 @@ type Options struct {
 	Throttle      ratelimit.Throttle
 	LogUsername   bool
 	Logger        *slog.Logger
+
+	// Observer is optional. A nil one is replaced with a no-op, so the
+	// request path never branches on whether metrics are enabled.
+	Observer Observer
 }
 
 // New returns a Server.
@@ -75,12 +80,18 @@ func New(opts Options) (*Server, error) {
 		return nil, fmt.Errorf("logger is required")
 	}
 
+	observer := opts.Observer
+	if observer == nil {
+		observer = nopObserver{}
+	}
+
 	srv := &Server{
 		cfg:         opts.Config,
 		auth:        opts.Authenticator,
 		log:         opts.Logger,
 		cache:       opts.Cache,
 		throttle:    opts.Throttle,
+		observer:    observer,
 		logUsername: opts.LogUsername,
 		startedAt:   time.Now(),
 	}
@@ -107,9 +118,9 @@ func New(opts Options) (*Server, error) {
 // without binding a port.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc(PathAuth, s.handleAuth)
-	mux.HandleFunc(PathHealth, s.handleHealth)
-	mux.HandleFunc(PathReady, s.handleReady)
+	mux.HandleFunc(PathAuth, s.observed("auth", s.handleAuth))
+	mux.HandleFunc(PathHealth, s.observed("healthz", s.handleHealth))
+	mux.HandleFunc(PathReady, s.observed("readyz", s.handleReady))
 
 	return mux
 }

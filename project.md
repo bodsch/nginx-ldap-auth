@@ -514,7 +514,7 @@ Recommended metrics:
 ### Authentication
 
 ```text
-nginx_ldap_auth_requests_total{policy, result}
+nginx_ldap_auth_requests_total{policy, result, reason}
 nginx_ldap_auth_request_duration_seconds{policy}
 ```
 
@@ -522,24 +522,53 @@ nginx_ldap_auth_request_duration_seconds{policy}
 
 One counter with a `result` label replaces the earlier `requests_total` / `success_total` / `failure_total` triple, which was redundant and could not be aggregated cleanly.
 
-`policy` is safe as a label because its value set is defined by the configuration. A `X-Auth-Policy` value that matches no policy must be recorded as the constant `unknown`, never as the received string — otherwise the label becomes attacker-controlled cardinality.
+`reason` carries the specific cause, from a closed set: `authenticated`, `invalid_credentials`, `group_required`, `no_credentials`, `empty_password`, `malformed_credentials`, `policy_unresolved`, `throttled_user`, `throttled_address`, `throttled_capacity`, `directory_error`, `directory_missing`.
+
+The second label is there because the five coarse values cannot express the distinction section 11 requires of the logs. A user who is not in the required group and an nginx location naming a policy that does not exist both produce a `403`; only one of them is somebody's mistake to fix. `result` is what an alert or a ratio is built on, `reason` is what answers why. A value outside the closed set is recorded as `other` — the set is made of constants in `internal/auth`, and the metrics layer must not depend on that staying true.
+
+`result` classifies the cause and not the HTTP status, and the two disagree in exactly one case: `policy_unresolved` is answered `403` but recorded as `error`. It is a configuration fault rather than an authorization outcome, and filed under `unauthorized` it would sit in the same series as group refusals — ordinary traffic on any protected site — so an alert tuned to tolerate those would never fire on the misconfiguration.
+
+`policy` is safe as a label because its value set is defined by the configuration, and the metrics layer is given that set rather than trusting its caller. Any other value, including a `X-Auth-Policy` that matches no policy, is recorded as the constant `unknown` — never as the received string, which would be cardinality chosen by whoever can set a header.
 
 ### LDAP
 
 ```text
-nginx_ldap_auth_ldap_requests_total{operation="bind|search", result="success|failure|error"}
+nginx_ldap_auth_ldap_requests_total{operation="bind|service_bind|search", result="success|failure|error"}
 nginx_ldap_auth_ldap_duration_seconds{operation}
 ```
 
 A separate `ldap_errors_total` is dropped; it is `ldap_requests_total{result="error"}`.
 
+`service_bind` is separate from `bind` although both are binds. A user bind happens once per uncached authentication; a service bind happens only on connect and reconnect. Counting them together makes the bind rate meaningless and hides a directory that is closing connections.
+
+`failure` means the directory answered and said no — a rejected password, a refused search. `error` means it never answered: a broken transport, a timeout, a certificate that could not be verified. An alert that cannot separate the two fires on users mistyping passwords, gets tuned to tolerate that, and then does not fire on the outage.
+
+A `search` observation spans the connection attempt that preceded it. That is the work the request paid for, and a connect that never completes is a search that never happened.
+
 ### Cache
 
 ```text
 nginx_ldap_auth_cache_requests_total{backend="memory|redis", result="hit|miss|error"}
-nginx_ldap_auth_cache_entries{backend="memory"}
+nginx_ldap_auth_cache_entries{backend}
+nginx_ldap_auth_cache_evictions_total{backend}
+nginx_ldap_auth_cache_expired_total{backend}
 nginx_ldap_auth_redis_duration_seconds
 ```
+
+`expired` separates a cold lookup from one whose entry had aged out: subtract it from `miss` to see how much of the miss rate is TTL rather than new traffic. A rising `evictions` means `cache.max_entries` is too small for the working set — or that something is spraying invalid usernames.
+
+These are read from the cache at scrape time rather than incremented alongside the cache's own counters. Two counters for one fact drift the first time somebody adds an early return; one authoritative counter read on demand cannot.
+
+### Throttle
+
+```text
+nginx_ldap_auth_throttle_entries
+nginx_ldap_auth_throttle_blocked_total
+nginx_ldap_auth_throttle_trips_total
+nginx_ldap_auth_throttle_capacity_denied_total
+```
+
+`trips` counts identities reaching their limit, `blocked` counts requests refused because of one. `capacity_denied` being anything other than zero means the throttle ran out of room to count and started refusing (section 12) — that is not a state normal traffic produces, and it deserves an alert of its own.
 
 ### HTTP
 
@@ -578,9 +607,11 @@ Suitable labels are those with a small, configuration-defined value set:
 
 ```text
 result="success|invalid_credentials|unauthorized|throttled|error"
-operation="bind|search"
+operation="bind|service_bind|search"
 backend="memory|redis"
 ```
+
+Every one of these is bounded inside the metrics layer rather than by whoever calls it. The exposition is scraped and usually kept for months, so a label value is long-term storage that nobody audits — and cardinality is a denial of service against the scrape, which takes every other metric down with it.
 
 ## 11. Logging
 

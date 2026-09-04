@@ -13,13 +13,16 @@ import (
 	"runtime"
 	"runtime/debug"
 	"syscall"
+	"time"
 
-	"git.boone-schulz.de/go/nginx-ldap-auth/internal/auth"
-	"git.boone-schulz.de/go/nginx-ldap-auth/internal/cache"
-	"git.boone-schulz.de/go/nginx-ldap-auth/internal/config"
-	"git.boone-schulz.de/go/nginx-ldap-auth/internal/policy"
-	"git.boone-schulz.de/go/nginx-ldap-auth/internal/ratelimit"
-	"git.boone-schulz.de/go/nginx-ldap-auth/internal/server"
+	"bodsch.me/nginx-ldap-auth/internal/auth"
+	"bodsch.me/nginx-ldap-auth/internal/cache"
+	"bodsch.me/nginx-ldap-auth/internal/config"
+	"bodsch.me/nginx-ldap-auth/internal/ldap"
+	"bodsch.me/nginx-ldap-auth/internal/metrics"
+	"bodsch.me/nginx-ldap-auth/internal/policy"
+	"bodsch.me/nginx-ldap-auth/internal/ratelimit"
+	"bodsch.me/nginx-ldap-auth/internal/server"
 )
 
 // version is overridden at build time with -ldflags "-X main.version=...".
@@ -79,11 +82,17 @@ func run(args []string, stdout, stderr io.Writer) error {
 		log.Warn("configuration warning", slog.String("detail", warning))
 	}
 
-	return serve(cfg, log)
+	// The signal handler is installed here rather than inside serve: a
+	// function that reaches for process-wide state cannot be composed, and
+	// cannot be tested without sending the test binary a signal.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	return serve(ctx, cfg, log)
 }
 
-// serve builds every component and runs the listener until a signal arrives.
-func serve(cfg *config.Config, log *slog.Logger) error {
+// serve builds every component and runs the listeners until ctx is cancelled.
+func serve(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	policies, err := policy.NewSet(cfg)
 	if err != nil {
 		return fmt.Errorf("prepare policies: %w", err)
@@ -99,7 +108,25 @@ func serve(cfg *config.Config, log *slog.Logger) error {
 		return fmt.Errorf("prepare throttle: %w", err)
 	}
 
-	directories, closeDirectories, err := auth.Directories(cfg, log)
+	collector, err := newMetrics(cfg, policies.Names(), decisionCache, throttle)
+	if err != nil {
+		return fmt.Errorf("prepare metrics: %w", err)
+	}
+
+	// A nil *metrics.Metrics would satisfy the observer interfaces and then
+	// panic on the first call, so the nil case is turned into no observer at
+	// all rather than a typed nil.
+	var (
+		ldapObserver   ldap.Observer
+		serverObserver server.Observer
+	)
+
+	if collector != nil {
+		ldapObserver = collector
+		serverObserver = collector
+	}
+
+	directories, closeDirectories, err := auth.Directories(cfg, log, ldapObserver)
 	if err != nil {
 		return fmt.Errorf("prepare directories: %w", err)
 	}
@@ -131,6 +158,7 @@ func serve(cfg *config.Config, log *slog.Logger) error {
 		Throttle:      throttle,
 		LogUsername:   cfg.Logging.LogUsername,
 		Logger:        log,
+		Observer:      serverObserver,
 	})
 	if err != nil {
 		return fmt.Errorf("prepare server: %w", err)
@@ -138,16 +166,99 @@ func serve(cfg *config.Config, log *slog.Logger) error {
 
 	logStartup(log, cfg, policies, decisionCache)
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
+	listeners := []func(context.Context) error{srv.Serve}
 
-	if err := srv.Serve(ctx); err != nil {
+	if collector != nil {
+		listeners = append(listeners, metrics.NewListener(cfg.Metrics, collector, log).Serve)
+	}
+
+	if err := runListeners(ctx, listeners); err != nil {
 		return err
 	}
 
 	log.Info("stopped")
 
 	return nil
+}
+
+// runListeners runs every listener until one fails or ctx is cancelled.
+//
+// The first failure brings the rest down. A service whose metrics listener
+// could not bind but whose authentication listener did would look healthy and
+// be unmonitored — which is worse than not starting, because the gap is
+// invisible precisely in the system that would have reported it.
+func runListeners(ctx context.Context, listeners []func(context.Context) error) error {
+	// A derived context, so cancelling on failure does not reach back into
+	// the caller's.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	failures := make(chan error, len(listeners))
+
+	for _, listen := range listeners {
+		serve := listen
+
+		go func() { failures <- serve(ctx) }()
+	}
+
+	var first error
+
+	for range listeners {
+		err := <-failures
+
+		if err != nil && first == nil {
+			first = err
+
+			// Bring the others down so that Serve returns and the
+			// remaining receives complete.
+			cancel()
+		}
+	}
+
+	return first
+}
+
+// newMetrics builds the metric set, or returns nil when metrics are disabled.
+func newMetrics(
+	cfg *config.Config,
+	policyNames []string,
+	decisionCache cache.Cache,
+	throttle ratelimit.Throttle,
+) (*metrics.Metrics, error) {
+	if !cfg.Metrics.Enabled {
+		return nil, nil
+	}
+
+	// Every configured timeout becomes a histogram boundary, so that an
+	// operation hitting one is visible as a bucket rather than disappearing
+	// into +Inf with everything else that was slow.
+	timeouts := []time.Duration{
+		cfg.Server.ReadTimeout.Duration(),
+		cfg.Server.WriteTimeout.Duration(),
+	}
+
+	for _, dir := range cfg.LDAP {
+		timeouts = append(timeouts, dir.BindTimeout.Duration(), dir.OperationTimeout.Duration())
+	}
+
+	if cfg.Redis.Enabled {
+		timeouts = append(timeouts, cfg.Redis.Timeout.Duration())
+	}
+
+	collector, err := metrics.New(metrics.Options{
+		Version:  version,
+		Policies: policyNames,
+		Timeouts: timeouts,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	if err := collector.RegisterState(decisionCache, throttle); err != nil {
+		return nil, err
+	}
+
+	return collector, nil
 }
 
 // newCache returns the decision cache and the keyer that derives its keys.

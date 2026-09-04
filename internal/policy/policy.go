@@ -15,8 +15,8 @@ import (
 
 	goldap "github.com/go-ldap/ldap/v3"
 
-	"git.boone-schulz.de/go/nginx-ldap-auth/internal/config"
-	"git.boone-schulz.de/go/nginx-ldap-auth/internal/ldap"
+	"bodsch.me/nginx-ldap-auth/internal/config"
+	"bodsch.me/nginx-ldap-auth/internal/ldap"
 )
 
 // Header is the request header nginx uses to select a policy.

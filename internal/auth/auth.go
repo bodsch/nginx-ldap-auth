@@ -14,11 +14,11 @@ import (
 	"log/slog"
 	"time"
 
-	"git.boone-schulz.de/go/nginx-ldap-auth/internal/cache"
-	"git.boone-schulz.de/go/nginx-ldap-auth/internal/config"
-	"git.boone-schulz.de/go/nginx-ldap-auth/internal/ldap"
-	"git.boone-schulz.de/go/nginx-ldap-auth/internal/policy"
-	"git.boone-schulz.de/go/nginx-ldap-auth/internal/ratelimit"
+	"bodsch.me/nginx-ldap-auth/internal/cache"
+	"bodsch.me/nginx-ldap-auth/internal/config"
+	"bodsch.me/nginx-ldap-auth/internal/ldap"
+	"bodsch.me/nginx-ldap-auth/internal/policy"
+	"bodsch.me/nginx-ldap-auth/internal/ratelimit"
 )
 
 // Status is the outcome of an authentication attempt, in the terms the HTTP
@@ -450,13 +450,23 @@ func groupNames(groups []ldap.Group) []string {
 // The returned map is keyed by the name a policy references, and the closers
 // are returned separately because the Directory interface deliberately has no
 // Close: a fake directory in a test has nothing to release.
-func Directories(cfg *config.Config, log *slog.Logger) (map[string]Directory, []func(), error) {
+func Directories(
+	cfg *config.Config,
+	log *slog.Logger,
+	observer ldap.Observer,
+) (map[string]Directory, []func(), error) {
 	clients := make(map[string]Directory, len(cfg.LDAP))
+
+	var opts []ldap.Option
+
+	if observer != nil {
+		opts = append(opts, ldap.WithObserver(observer))
+	}
 
 	var closers []func()
 
 	for name, dir := range cfg.LDAP {
-		client, err := ldap.New(dir, log)
+		client, err := ldap.New(dir, log, opts...)
 		if err != nil {
 			for _, release := range closers {
 				release()

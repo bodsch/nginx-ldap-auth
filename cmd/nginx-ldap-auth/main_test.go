@@ -2,12 +2,20 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"fmt"
+	"io"
+	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"bodsch.me/nginx-ldap-auth/internal/config"
+	"bodsch.me/nginx-ldap-auth/internal/metrics"
 )
 
 // validConfig writes a complete configuration plus its pepper file and returns
@@ -209,5 +217,157 @@ func TestUnknownFlagIsRefused(t *testing.T) {
 	// binary. A flag typo in the unit file must not start the service.
 	if _, _, err := invoke(t, "--not-a-flag"); err == nil {
 		t.Fatal("an unknown flag was accepted")
+	}
+}
+
+// metricsConfig writes a configuration with both listeners enabled.
+func metricsConfig(t *testing.T, listen, metricsAddress string) string {
+	t.Helper()
+
+	dir := t.TempDir()
+
+	pepper := filepath.Join(dir, "pepper.secret")
+	if err := os.WriteFile(pepper, []byte(strings.Repeat("p", 64)), 0o600); err != nil {
+		t.Fatalf("write pepper: %v", err)
+	}
+
+	path := filepath.Join(dir, "config.yaml")
+
+	body := fmt.Sprintf(`
+server:
+  listen: %s
+default_policy: intranet
+policies:
+  intranet:
+    realm: "Intranet"
+    ldap: primary
+    allow_any_user: true
+ldap:
+  primary:
+    url: ldaps://127.0.0.1:636
+    base_dn: dc=example,dc=org
+cache:
+  enabled: true
+  pepper_file: %s
+metrics:
+  enabled: true
+  address: %s
+`, listen, pepper, metricsAddress)
+
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	return path
+}
+
+// TestBothListenersAreServed is the wiring test for the second listener.
+//
+// It is the one thing unit tests of internal/metrics cannot cover: that the
+// exposition is actually reachable in a running process, on the address the
+// configuration named, and not merely constructed.
+func TestBothListenersAreServed(t *testing.T) {
+	authAddress := freeAddress(t)
+	metricsAddress := freeAddress(t)
+
+	path := metricsConfig(t, authAddress, metricsAddress)
+
+	cfg, _, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+
+	done := make(chan error, 1)
+
+	go func() { done <- serve(ctx, cfg, slog.New(slog.NewTextHandler(io.Discard, nil))) }()
+
+	t.Cleanup(func() {
+		cancel()
+
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("serve: %v", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Error("serve did not return after its context was cancelled; " +
+				"systemctl stop would hang and systemd would eventually SIGKILL the process")
+		}
+	})
+
+	waitForHTTP(t, "http://"+authAddress+"/healthz")
+
+	body := waitForHTTP(t, "http://"+metricsAddress+metrics.Path)
+
+	for _, want := range []string{
+		"nginx_ldap_auth_info",
+		"nginx_ldap_auth_cache_entries",
+		"nginx_ldap_auth_throttle_entries",
+		"process_start_time_seconds",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("the exposition is missing %q", want)
+		}
+	}
+}
+
+// TestSharedAddressIsRefusedBeforeStarting: two listeners on one address is a
+// configuration error, and it has to be reported as one rather than as
+// whichever listener lost the race to bind.
+func TestSharedAddressIsRefusedBeforeStarting(t *testing.T) {
+	address := freeAddress(t)
+
+	_, _, err := invoke(t, "--check", "--config", metricsConfig(t, address, address))
+	if err == nil {
+		t.Fatal("a shared address was accepted")
+	}
+
+	if !strings.Contains(err.Error(), "separate addresses") {
+		t.Errorf("err = %v, want it to explain the collision", err)
+	}
+}
+
+// freeAddress returns a loopback address nothing is listening on.
+func freeAddress(t *testing.T) string {
+	t.Helper()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+
+	address := listener.Addr().String()
+
+	if err := listener.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	return address
+}
+
+// waitForHTTP polls until the endpoint answers, and returns the body.
+func waitForHTTP(t *testing.T, url string) string {
+	t.Helper()
+
+	deadline := time.Now().Add(10 * time.Second)
+
+	for {
+		resp, err := http.Get(url) //nolint:gosec,noctx // a loopback address this test just chose
+		if err == nil {
+			body, readErr := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+
+			if readErr == nil && resp.StatusCode == http.StatusOK {
+				return string(body)
+			}
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatalf("%s never answered: %v", url, err)
+		}
+
+		time.Sleep(5 * time.Millisecond)
 	}
 }

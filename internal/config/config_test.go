@@ -423,3 +423,83 @@ func containsSubstring(values []string, want string) bool {
 
 	return false
 }
+
+func TestMetricsValidation(t *testing.T) {
+	base := func(metrics string) string {
+		return `
+server:
+  listen: 127.0.0.1:8080
+policies:
+  intranet:
+    ldap: primary
+    allow_any_user: true
+ldap:
+  primary:
+    url: ldaps://dir.example.org:636
+    base_dn: dc=example,dc=org
+cache:
+  enabled: false
+` + metrics
+	}
+
+	t.Run("enabled and valid", func(t *testing.T) {
+		cfg, _, err := loadYAML(t, base("metrics:\n  enabled: true\n  address: 127.0.0.1:9931\n"))
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+
+		if !cfg.Metrics.Enabled {
+			t.Error("metrics.enabled was not read")
+		}
+	})
+
+	t.Run("no address", func(t *testing.T) {
+		_, _, err := loadYAML(t, base("metrics:\n  enabled: true\n  address: \"\"\n"))
+		if err == nil || !strings.Contains(err.Error(), "metrics.address must be set") {
+			t.Errorf("err = %v, want a refusal naming metrics.address", err)
+		}
+	})
+
+	// Two listeners cannot share an address, and the failure has to name
+	// both settings rather than surfacing as "address already in use" from
+	// whichever listener lost the race.
+	t.Run("same address as the authentication listener", func(t *testing.T) {
+		_, _, err := loadYAML(t, base("metrics:\n  enabled: true\n  address: 127.0.0.1:8080\n"))
+		if err == nil {
+			t.Fatal("a shared address was accepted")
+		}
+
+		for _, want := range []string{"metrics.address", "server.listen"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("err = %v, want it to name %s", err, want)
+			}
+		}
+	})
+
+	// The exposition names policies and carries failure counts. Binding it
+	// publicly is allowed — some setups scrape across a network — but it
+	// must be said out loud.
+	t.Run("public address warns", func(t *testing.T) {
+		_, warnings, err := loadYAML(t, base("metrics:\n  enabled: true\n  address: 0.0.0.0:9931\n"))
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+
+		if !containsSubstring(warnings, "monitoring network") {
+			t.Errorf("warnings = %q, want one about exposure", warnings)
+		}
+	})
+
+	// Metrics used to be refused as unimplemented. A configuration that
+	// enables them must now start without a warning saying otherwise.
+	t.Run("no longer reported as unimplemented", func(t *testing.T) {
+		_, warnings, err := loadYAML(t, base("metrics:\n  enabled: true\n  address: 127.0.0.1:9931\n"))
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+
+		if containsSubstring(warnings, "not implemented") {
+			t.Errorf("warnings = %q, still claim metrics are unimplemented", warnings)
+		}
+	})
+}

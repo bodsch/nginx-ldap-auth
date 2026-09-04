@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"git.boone-schulz.de/go/nginx-ldap-auth/internal/config"
-	"git.boone-schulz.de/go/nginx-ldap-auth/internal/ldap"
+	"bodsch.me/nginx-ldap-auth/internal/config"
+	"bodsch.me/nginx-ldap-auth/internal/ldap"
 )
 
 func testSet(t *testing.T, defaultPolicy string) *Set {

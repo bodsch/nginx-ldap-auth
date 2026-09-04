@@ -25,7 +25,7 @@ import (
 
 	goldap "github.com/go-ldap/ldap/v3"
 
-	"git.boone-schulz.de/go/nginx-ldap-auth/internal/config"
+	"bodsch.me/nginx-ldap-auth/internal/config"
 )
 
 // ErrInvalidCredentials means the directory refused the credentials, or the
@@ -52,6 +52,47 @@ const maxGroupEntries = 256
 // which of the entries the client meant, and picking one would be a guess about
 // who is logging in.
 var ErrAmbiguousUser = errors.New("user filter matched more than one entry")
+
+// Operation names for the Observer, and the closed set of results.
+//
+// The service bind is reported separately from a user bind even though both are
+// binds. They answer different questions: a user bind happens once per
+// uncached authentication, while a service bind happens only on connect and on
+// reconnect. Counting them together would make the bind rate meaningless and
+// hide a directory that is closing connections.
+const (
+	OperationBind        = "bind"
+	OperationServiceBind = "service_bind"
+	OperationSearch      = "search"
+
+	// ResultSuccess means the operation completed.
+	ResultSuccess = "success"
+
+	// ResultFailure means the directory answered and said no. A rejected
+	// password is a failure; so is a refused search.
+	ResultFailure = "failure"
+
+	// ResultError means the operation never got an answer: a broken
+	// transport, a timeout, a TLS handshake that could not be verified.
+	ResultError = "error"
+)
+
+// Observer receives one report per directory operation.
+//
+// The interface lives here rather than in internal/metrics so that this package
+// keeps no dependency on a metrics library, and so that what is reported is
+// decided by the code that knows what it did.
+type Observer interface {
+	ObserveLDAP(operation, result string, elapsed time.Duration)
+}
+
+// Option adjusts a Client at construction.
+type Option func(*Client)
+
+// WithObserver attaches an observer.
+func WithObserver(observer Observer) Option {
+	return func(c *Client) { c.observer = observer }
+}
 
 // Group is one resolved group membership.
 //
@@ -94,6 +135,8 @@ type Client struct {
 	log *slog.Logger
 	tls *tls.Config
 
+	observer Observer
+
 	// serviceMu guards the pooled service-account connection.
 	//
 	// One connection means searches are serialised. For the deployment this
@@ -106,17 +149,49 @@ type Client struct {
 }
 
 // New returns a Client for one configured directory.
-func New(cfg *config.LDAP, log *slog.Logger) (*Client, error) {
+func New(cfg *config.LDAP, log *slog.Logger, opts ...Option) (*Client, error) {
 	tlsConfig, err := tlsConfigFor(cfg)
 	if err != nil {
 		return nil, err
 	}
 
-	return &Client{
+	client := &Client{
 		cfg: cfg,
 		log: log.With(slog.String("directory", cfg.Name)),
 		tls: tlsConfig,
-	}, nil
+	}
+
+	for _, opt := range opts {
+		opt(client)
+	}
+
+	return client, nil
+}
+
+// observe reports one completed operation.
+func (c *Client) observe(operation string, started time.Time, err error) {
+	if c.observer == nil {
+		return
+	}
+
+	c.observer.ObserveLDAP(operation, resultFor(err), time.Since(started))
+}
+
+// resultFor classifies an operation's outcome.
+//
+// The distinction that matters is between an answer and no answer. "The
+// directory rejected this password" is normal traffic; "the directory could not
+// be reached" is an outage, and an alert that cannot tell them apart will fire
+// on users mistyping their passwords.
+func resultFor(err error) string {
+	switch {
+	case err == nil:
+		return ResultSuccess
+	case isConnectionError(err):
+		return ResultError
+	default:
+		return ResultFailure
+	}
 }
 
 // Name returns the directory's configured name.
@@ -195,6 +270,8 @@ func (c *Client) findUser(user string) (*goldap.Entry, error) {
 
 	var entries []*goldap.Entry
 
+	started := time.Now()
+
 	err := c.withService(func(conn *goldap.Conn) error {
 		result, err := conn.Search(c.searchRequest(c.cfg.BaseDN, filter, attributes, maxUserEntries))
 		if err != nil {
@@ -205,6 +282,8 @@ func (c *Client) findUser(user string) (*goldap.Entry, error) {
 
 		return nil
 	})
+
+	c.observe(OperationSearch, started, err)
 
 	switch {
 	case goldap.IsErrorWithCode(err, goldap.LDAPResultSizeLimitExceeded):
@@ -226,14 +305,22 @@ func (c *Client) findUser(user string) (*goldap.Entry, error) {
 // never returned to the pool: a bound connection carries that user's identity,
 // and a later search on it would run as them.
 func (c *Client) bindAs(dn, password string) error {
+	started := time.Now()
+
 	conn, err := c.dial()
 	if err != nil {
+		c.observe(OperationBind, started, err)
+
 		return fmt.Errorf("connect for user bind: %w", err)
 	}
 
 	defer conn.Close()
 
-	if err := conn.Bind(dn, password); err != nil {
+	err = conn.Bind(dn, password)
+
+	c.observe(OperationBind, started, err)
+
+	if err != nil {
 		if goldap.IsErrorWithCode(err, goldap.LDAPResultInvalidCredentials) {
 			return fmt.Errorf("%w: directory rejected the password", ErrInvalidCredentials)
 		}

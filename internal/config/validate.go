@@ -45,6 +45,10 @@ func (c *Config) validate() (warnings []string, err error) {
 	problems = append(problems, rateProblems...)
 	warnings = append(warnings, rateWarnings...)
 
+	metricsProblems, metricsWarnings := c.validateMetrics()
+	problems = append(problems, metricsProblems...)
+	warnings = append(warnings, metricsWarnings...)
+
 	unsupportedProblems, unsupportedWarnings := c.validateUnsupported()
 	problems = append(problems, unsupportedProblems...)
 	warnings = append(warnings, unsupportedWarnings...)
@@ -492,9 +496,49 @@ func (c *Config) validateUnsupported() (problems []error, warnings []string) {
 				"the in-process cache is used instead, which is not shared between instances"))
 	}
 
-	if c.Metrics.Enabled {
-		warnings = append(warnings, "metrics.enabled is true, but the metrics endpoint is not implemented yet "+
-			"(milestone 2); the setting is ignored")
+	return problems, warnings
+}
+
+// validateMetrics checks the exposition listener.
+func (c *Config) validateMetrics() (problems []error, warnings []string) {
+	if !c.Metrics.Enabled {
+		return problems, warnings
+	}
+
+	if c.Metrics.Address == "" {
+		problems = append(problems, fmt.Errorf("metrics.address must be set while metrics are enabled"))
+
+		return problems, warnings
+	}
+
+	host, _, err := net.SplitHostPort(c.Metrics.Address)
+	if err != nil {
+		problems = append(problems, fmt.Errorf("metrics.address %q is not a host:port address: %w",
+			c.Metrics.Address, err))
+
+		return problems, warnings
+	}
+
+	// Two listeners cannot share one address. Caught here so that the
+	// failure names the two settings involved rather than surfacing as
+	// "address already in use" from whichever listener lost the race.
+	if c.Metrics.Address == c.Server.Listen {
+		problems = append(problems, fmt.Errorf(
+			"metrics.address and server.listen are both %q: the exposition and the authentication "+
+				"endpoint need separate addresses, which is what lets them be firewalled apart",
+			c.Metrics.Address))
+	}
+
+	address := net.ParseIP(host)
+
+	switch {
+	case host == "":
+		warnings = append(warnings, "metrics.address binds every interface: the exposition names policies "+
+			"and carries failure counts, and it should be reachable from the monitoring network only")
+	case address != nil && !address.IsLoopback():
+		warnings = append(warnings, fmt.Sprintf(
+			"metrics.address is the non-loopback address %s: make sure only the monitoring network can "+
+				"reach it", host))
 	}
 
 	return problems, warnings

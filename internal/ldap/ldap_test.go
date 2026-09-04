@@ -15,13 +15,14 @@ import (
 	"math/big"
 	"net"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	goldap "github.com/go-ldap/ldap/v3"
 
-	"git.boone-schulz.de/go/nginx-ldap-auth/internal/config"
+	"bodsch.me/nginx-ldap-auth/internal/config"
 )
 
 func discardLogger() *slog.Logger {
@@ -570,6 +571,159 @@ func TestGroupFilterEscapesInjection(t *testing.T) {
 
 			if got := client.groupFilter(test.identity); got != test.want {
 				t.Errorf("groupFilter = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+// recordingObserver captures the operations a client reported.
+type recordingObserver struct {
+	mu   sync.Mutex
+	seen []observed
+}
+
+type observed struct {
+	operation string
+	result    string
+	elapsed   time.Duration
+}
+
+func (o *recordingObserver) ObserveLDAP(operation, result string, elapsed time.Duration) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	o.seen = append(o.seen, observed{operation, result, elapsed})
+}
+
+func (o *recordingObserver) snapshot() []observed {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	return append([]observed(nil), o.seen...)
+}
+
+// TestUnreachableDirectoryIsReportedAsAnError is the distinction the LDAP
+// metric exists to make.
+//
+// "The directory rejected this password" is normal traffic on any protected
+// site. "The directory could not be reached" is an outage. An alert that cannot
+// tell them apart fires on users mistyping their passwords, gets tuned to
+// tolerate that, and then does not fire on the outage.
+func TestUnreachableDirectoryIsReportedAsAnError(t *testing.T) {
+	observer := &recordingObserver{}
+
+	client, err := New(&config.LDAP{
+		Name:             "unreachable",
+		URL:              "ldap://127.0.0.1:1",
+		BaseDN:           "dc=example,dc=org",
+		UserFilter:       "(uid=%s)",
+		UserAttribute:    "uid",
+		GroupSource:      config.GroupSourceNone,
+		BindTimeout:      config.Duration(time.Second),
+		OperationTimeout: config.Duration(time.Second),
+	}, discardLogger(), WithObserver(observer))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	defer client.Close()
+
+	if _, err := client.Authenticate(context.Background(), "alice", "s3cret"); err == nil {
+		t.Fatal("expected the unreachable directory to fail")
+	}
+
+	seen := observer.snapshot()
+
+	if len(seen) != 1 {
+		t.Fatalf("observed %+v, want exactly one operation", seen)
+	}
+
+	// The search operation spans the connection attempt on purpose: that is
+	// the work the request paid for, and a connect that never completes is
+	// a search that never happened.
+	if seen[0].operation != OperationSearch {
+		t.Errorf("operation = %q, want %q", seen[0].operation, OperationSearch)
+	}
+
+	if seen[0].result != ResultError {
+		t.Errorf("result = %q, want %q: an unreachable directory is not a rejected password",
+			seen[0].result, ResultError)
+	}
+}
+
+// TestEmptyPasswordIsNotReportedAsADirectoryOperation keeps the LDAP metric
+// honest about what the directory was actually asked.
+//
+// The refusal happens before any connection. Counting it as a bind would
+// inflate the bind rate with requests the directory never saw, and would make
+// an anonymous-bind probe look like ordinary authentication load.
+func TestEmptyPasswordIsNotReportedAsADirectoryOperation(t *testing.T) {
+	observer := &recordingObserver{}
+
+	client, err := New(&config.LDAP{
+		Name:             "unreachable",
+		URL:              "ldap://127.0.0.1:1",
+		BaseDN:           "dc=example,dc=org",
+		UserFilter:       "(uid=%s)",
+		UserAttribute:    "uid",
+		GroupSource:      config.GroupSourceNone,
+		BindTimeout:      config.Duration(time.Second),
+		OperationTimeout: config.Duration(time.Second),
+	}, discardLogger(), WithObserver(observer))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	defer client.Close()
+
+	if _, err := client.Authenticate(context.Background(), "alice", ""); !errors.Is(err, ErrInvalidCredentials) {
+		t.Fatalf("err = %v, want ErrInvalidCredentials", err)
+	}
+
+	if seen := observer.snapshot(); len(seen) != 0 {
+		t.Errorf("observed %+v, want nothing: the directory was never asked", seen)
+	}
+}
+
+// TestTLSFailureIsReportedAsAnError pairs the observation with the safety
+// property: a certificate that cannot be verified is an infrastructure error in
+// the metrics as well as in the returned error.
+func TestTLSFailureIsReportedAsAnError(t *testing.T) {
+	_, pair := selfSigned(t)
+	address, _ := tlsDirectory(t, pair)
+
+	observer := &recordingObserver{}
+
+	client := directoryClient(t, address, nil)
+	client.observer = observer
+
+	if _, err := client.Authenticate(context.Background(), "alice", "s3cret"); err == nil {
+		t.Fatal("expected the untrusted certificate to fail the attempt")
+	}
+
+	seen := observer.snapshot()
+
+	if len(seen) != 1 || seen[0].result != ResultError {
+		t.Fatalf("observed %+v, want a single error", seen)
+	}
+}
+
+func TestResultClassification(t *testing.T) {
+	tests := map[string]struct {
+		err  error
+		want string
+	}{
+		"no error":         {err: nil, want: ResultSuccess},
+		"rejected":         {err: goldap.NewError(goldap.LDAPResultInvalidCredentials, errors.New("no")), want: ResultFailure},
+		"no such object":   {err: goldap.NewError(goldap.LDAPResultNoSuchObject, errors.New("gone")), want: ResultFailure},
+		"network":          {err: goldap.NewError(goldap.ErrorNetwork, errors.New("reset")), want: ResultError},
+		"connection reset": {err: &net.OpError{Op: "read", Err: errors.New("reset")}, want: ResultError},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			if got := resultFor(test.err); got != test.want {
+				t.Errorf("resultFor(%v) = %q, want %q", test.err, got, test.want)
 			}
 		})
 	}

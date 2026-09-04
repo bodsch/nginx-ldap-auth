@@ -14,10 +14,12 @@ question: may this request through?
 
 ## Status
 
-Milestone 1. Authentication, authorization, caching and throttling work and are
-covered by tests. Prometheus metrics, the shared Redis cache backend and the
-integration suite against a real directory are milestone 2 — see
-[project.md](project.md) §21.
+Milestone 1 complete, milestone 2 in progress.
+
+Working and covered by tests: authentication, authorization, caching,
+throttling, and Prometheus metrics. Still open from milestone 2: the shared
+Redis cache backend, the integration suite against a real directory, and the
+Arch Linux PKGBUILD — see [project.md](project.md) §21.
 
 ## Install
 
@@ -221,11 +223,44 @@ The ones that are deliberate rather than incidental:
 
 ## Endpoints
 
+On the authentication listener (`server.listen`, loopback):
+
 | Path | Purpose |
 |---|---|
 | `/auth` | the decision, called by nginx. Not for clients. |
 | `/healthz` | liveness. Deliberately independent of LDAP: a failing probe means a restart, and a restart discards the cache that was absorbing the outage. |
 | `/readyz` | readiness, plus cache and throttle counters as JSON. |
+
+On its own listener (`metrics.address`), so the two can be firewalled apart:
+
+| Path | Purpose |
+|---|---|
+| `/metrics` | Prometheus/OpenMetrics exposition. |
+
+### The four metrics worth alerting on
+
+```promql
+# The directory is unreachable — not users mistyping passwords.
+rate(nginx_ldap_auth_ldap_requests_total{result="error"}[5m]) > 0
+
+# Somebody's nginx names a policy that does not exist. Answered 403, but
+# recorded as an error, because the user it was refused for cannot fix it.
+rate(nginx_ldap_auth_requests_total{reason="policy_unresolved"}[5m]) > 0
+
+# The throttle ran out of room to count and started refusing. Not a state
+# normal traffic produces.
+rate(nginx_ldap_auth_throttle_capacity_denied_total[5m]) > 0
+
+# The cache is too small for the working set, so every page view is paying
+# for LDAP binds again.
+rate(nginx_ldap_auth_cache_evictions_total[5m]) > 0
+```
+
+`nginx_ldap_auth_requests_total` carries both a coarse `result` and a specific
+`reason`: build ratios on the first, diagnose with the second. Uptime comes from
+`process_start_time_seconds`, which the process collector provides — there is
+deliberately no uptime gauge of our own, because a gauge counting up from
+process start is a counter that silently resets.
 
 ## Development
 

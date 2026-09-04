@@ -15,16 +15,17 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"git.boone-schulz.de/go/nginx-ldap-auth/internal/auth"
-	"git.boone-schulz.de/go/nginx-ldap-auth/internal/cache"
-	"git.boone-schulz.de/go/nginx-ldap-auth/internal/config"
-	"git.boone-schulz.de/go/nginx-ldap-auth/internal/ldap"
-	"git.boone-schulz.de/go/nginx-ldap-auth/internal/policy"
-	"git.boone-schulz.de/go/nginx-ldap-auth/internal/ratelimit"
+	"bodsch.me/nginx-ldap-auth/internal/auth"
+	"bodsch.me/nginx-ldap-auth/internal/cache"
+	"bodsch.me/nginx-ldap-auth/internal/config"
+	"bodsch.me/nginx-ldap-auth/internal/ldap"
+	"bodsch.me/nginx-ldap-auth/internal/policy"
+	"bodsch.me/nginx-ldap-auth/internal/ratelimit"
 )
 
 // stubDirectory answers for exactly one credential pair and rejects everything
@@ -111,6 +112,9 @@ type testOptions struct {
 	// notReady leaves the server without a listener, which is the state a
 	// process is in before Serve binds.
 	notReady bool
+
+	// observer, when set, receives the decision and HTTP reports.
+	observer Observer
 }
 
 func newTestServer(t *testing.T, opts testOptions) *testServer {
@@ -200,6 +204,7 @@ func newTestServer(t *testing.T, opts testOptions) *testServer {
 		Throttle:      throttle,
 		LogUsername:   opts.logUsername,
 		Logger:        log,
+		Observer:      opts.observer,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -1018,5 +1023,175 @@ func TestShutdownWaitsForAnInFlightRequest(t *testing.T) {
 
 	if err := <-shutdown; err != nil {
 		t.Errorf("shutdown: %v", err)
+	}
+}
+
+// recordingObserver captures what the server reported.
+type recordingObserver struct {
+	mu    sync.Mutex
+	auths []observedAuth
+	https []observedHTTP
+}
+
+type observedAuth struct {
+	policy  string
+	status  auth.Status
+	reason  string
+	elapsed time.Duration
+}
+
+type observedHTTP struct {
+	handler string
+	code    int
+}
+
+func (o *recordingObserver) ObserveAuth(policy string, status auth.Status, reason string, elapsed time.Duration) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	o.auths = append(o.auths, observedAuth{policy, status, reason, elapsed})
+}
+
+func (o *recordingObserver) ObserveHTTP(handler string, code int, elapsed time.Duration) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	o.https = append(o.https, observedHTTP{handler, code})
+}
+
+func (o *recordingObserver) snapshot() ([]observedAuth, []observedHTTP) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	return append([]observedAuth(nil), o.auths...), append([]observedHTTP(nil), o.https...)
+}
+
+// TestEveryDecisionIsObserved checks the reporting covers all five outcomes.
+//
+// A metric that is only incremented on the paths somebody remembered is worse
+// than no metric: the ratio it feeds is wrong in the safe-looking direction,
+// because the failures that were forgotten are missing from the denominator as
+// well as the numerator.
+func TestEveryDecisionIsObserved(t *testing.T) {
+	throttle, err := ratelimit.New(ratelimit.Config{
+		Window:                time.Minute,
+		BlockDuration:         5 * time.Minute,
+		MaxFailuresPerUser:    1,
+		MaxFailuresPerAddress: 0,
+		MaxEntries:            10,
+	})
+	if err != nil {
+		t.Fatalf("ratelimit.New: %v", err)
+	}
+
+	observer := &recordingObserver{}
+
+	ts := newTestServer(t, testOptions{
+		directory:  directoryFor(aliceIn("other-group")),
+		requireGrp: []string{"web-users"},
+		throttle:   throttle,
+		observer:   observer,
+	})
+
+	// Each request produces a different outcome.
+	ts.authRequest(t, "", "", nil)                                                 // 401 no credentials
+	ts.authRequest(t, "alice", "s3cret", nil)                                      // 403 group required
+	ts.authRequest(t, "alice", "wrong", nil)                                       // 401 invalid
+	ts.authRequest(t, "alice", "wrong", nil)                                       // 429 throttled
+	ts.authRequest(t, "alice", "s3cret", map[string]string{policy.Header: "gone"}) // 403 unknown policy
+
+	auths, https := observer.snapshot()
+
+	if len(auths) != 5 {
+		t.Fatalf("observed %d decisions, want 5: %+v", len(auths), auths)
+	}
+
+	reasons := make(map[string]bool, len(auths))
+	for _, observed := range auths {
+		reasons[observed.reason] = true
+	}
+
+	for _, want := range []string{"no_credentials", "group_required", "invalid_credentials",
+		"throttled_user", "policy_unresolved"} {
+		if !reasons[want] {
+			t.Errorf("reason %q was never reported: %+v", want, auths)
+		}
+	}
+
+	// The policy is empty exactly when resolution failed, and the metrics
+	// layer turns that into its own constant. The server must not invent
+	// one here, because the value it would invent is the request's.
+	for _, observed := range auths {
+		if observed.reason == "policy_unresolved" && observed.policy != "" {
+			t.Errorf("an unresolved policy was reported as %q, want empty", observed.policy)
+		}
+	}
+
+	if len(https) != 5 {
+		t.Errorf("observed %d HTTP requests, want 5: %+v", len(https), https)
+	}
+}
+
+// TestHTTPObservationRecordsTheActualCode guards the response wrapper.
+//
+// The wrapper is the only way to learn what a handler sent. If it lost the
+// code, every request would be recorded as 200 and the HTTP metric would show a
+// perfectly healthy service refusing everything.
+func TestHTTPObservationRecordsTheActualCode(t *testing.T) {
+	observer := &recordingObserver{}
+
+	ts := newTestServer(t, testOptions{
+		directory: directoryFor(aliceIn("web-users")),
+		observer:  observer,
+	})
+
+	ts.authRequest(t, "alice", "s3cret", nil)
+	ts.authRequest(t, "alice", "wrong", nil)
+
+	recorder := httptest.NewRecorder()
+	ts.handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, PathHealth, nil))
+
+	_, https := observer.snapshot()
+
+	want := []observedHTTP{
+		{handler: "auth", code: http.StatusOK},
+		{handler: "auth", code: http.StatusUnauthorized},
+		{handler: "healthz", code: http.StatusOK},
+	}
+
+	if len(https) != len(want) {
+		t.Fatalf("observed %+v, want %+v", https, want)
+	}
+
+	for i, expected := range want {
+		if https[i] != expected {
+			t.Errorf("observation %d = %+v, want %+v", i, https[i], expected)
+		}
+	}
+}
+
+// TestResponseWrapperStaysTransparent: the identity headers and the challenge
+// have to survive the wrapper, or enabling metrics would break the login it is
+// measuring.
+func TestResponseWrapperStaysTransparent(t *testing.T) {
+	ts := newTestServer(t, testOptions{
+		directory: directoryFor(aliceIn("web-users")),
+		observer:  &recordingObserver{},
+	})
+
+	allowed := ts.authRequest(t, "alice", "s3cret", nil)
+
+	if got := allowed.Header().Get(HeaderUser); got != "alice" {
+		t.Errorf("%s = %q, want it to pass through the wrapper", HeaderUser, got)
+	}
+
+	refused := ts.authRequest(t, "", "", nil)
+
+	if refused.Header().Get("WWW-Authenticate") == "" {
+		t.Error("the challenge was lost in the wrapper")
+	}
+
+	if refused.Body.Len() == 0 {
+		t.Error("the body was lost in the wrapper")
 	}
 }

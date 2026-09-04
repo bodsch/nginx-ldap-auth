@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"git.boone-schulz.de/go/nginx-ldap-auth/internal/auth"
-	"git.boone-schulz.de/go/nginx-ldap-auth/internal/policy"
+	"bodsch.me/nginx-ldap-auth/internal/auth"
+	"bodsch.me/nginx-ldap-auth/internal/policy"
 )
 
 // Response headers carrying the authenticated identity upstream.
@@ -42,8 +42,11 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 		RemoteAddress: s.clientAddress(r),
 	})
 
+	elapsed := time.Since(started)
+
 	s.writeAuthResponse(w, result)
-	s.logDecision(r, result, time.Since(started))
+	s.logDecision(r, result, elapsed)
+	s.observer.ObserveAuth(result.Policy, result.Status, result.Reason, elapsed)
 }
 
 // writeAuthResponse turns a decision into the response nginx evaluates.
