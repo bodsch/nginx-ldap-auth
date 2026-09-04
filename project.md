@@ -495,7 +495,7 @@ HTTP/1.1 200 OK
 
 Readiness endpoint.
 
-It verifies that the service has loaded a valid configuration, has read its secrets, and is able to serve authentication requests.
+It reports whether the listener is up. A valid configuration and readable secrets are implied rather than re-checked: startup refuses without them, so a process that got far enough to answer this endpoint already has both.
 
 Backend connectivity should be handled carefully. A transient LDAP outage must not cause unnecessary restarts. For a single-instance systemd deployment there is no load balancer acting on readiness at all, so this endpoint is a diagnostic aid — it should not grow into a health-check framework.
 
@@ -634,7 +634,9 @@ Security is a primary design requirement.
 - Apply strict network and HTTP timeouts.
 - Limit request body/header sizes where applicable.
 - Reject malformed Basic Authentication headers.
-- Use constant-time comparisons where applicable.
+- Never compare a secret locally. This replaces an earlier requirement to "use constant-time comparisons where applicable", which was wrong to state: nothing in the service compares a secret, so there was nothing for it to apply to and no way to verify it. A password is emptiness-checked, fed to an HMAC, and sent to the directory — never matched against a stored value. The property to preserve is the absence of such a comparison, not a timing-safe way to perform one; adding a local password check would be the change that makes constant-time comparison necessary, and it should not be made.
+- A decision nobody set must deny. The zero value of the cached decision is "invalid credentials", so a struct produced by a failed deserialisation, a partial write, or a field added later refuses access rather than granting it.
+- A cache that returns an error is a cache miss, whatever else it reports. A backend may return a hit and an error together; the error alone disqualifies the entry.
 - Avoid high-cardinality Prometheus labels.
 - Do not expose internal authentication endpoints unnecessarily.
 - Run as an unprivileged system user.
