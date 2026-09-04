@@ -49,9 +49,9 @@ func (c *Config) validate() (warnings []string, err error) {
 	problems = append(problems, metricsProblems...)
 	warnings = append(warnings, metricsWarnings...)
 
-	unsupportedProblems, unsupportedWarnings := c.validateUnsupported()
-	problems = append(problems, unsupportedProblems...)
-	warnings = append(warnings, unsupportedWarnings...)
+	redisProblems, redisWarnings := c.validateRedis()
+	problems = append(problems, redisProblems...)
+	warnings = append(warnings, redisWarnings...)
 
 	if len(problems) > 0 {
 		return warnings, fmt.Errorf("invalid configuration:\n%s", indentErrors(problems))
@@ -484,16 +484,54 @@ func (c *Config) validateRateLimit() (problems []error, warnings []string) {
 	return problems, warnings
 }
 
-// validateUnsupported rejects settings that this milestone does not implement.
-//
-// Accepting them silently would be worse than refusing them: an operator who
-// writes redis.enabled: true and gets no error believes several instances share
-// their decisions, when in fact each one caches on its own.
-func (c *Config) validateUnsupported() (problems []error, warnings []string) {
-	if c.Redis.Enabled {
+// validateRedis checks the shared cache backend.
+func (c *Config) validateRedis() (problems []error, warnings []string) {
+	if !c.Redis.Enabled {
+		return problems, warnings
+	}
+
+	if !c.Cache.Enabled {
 		problems = append(problems, fmt.Errorf(
-			"redis.enabled is true, but the Redis cache backend is not implemented yet (milestone 2): "+
-				"the in-process cache is used instead, which is not shared between instances"))
+			"redis.enabled is true but cache.enabled is false: Redis is a cache backend, "+
+				"so disabling the cache disables it too"))
+	}
+
+	if c.Redis.Address == "" {
+		problems = append(problems, fmt.Errorf("redis.address must be set while redis is enabled"))
+	} else if _, _, err := net.SplitHostPort(c.Redis.Address); err != nil {
+		problems = append(problems, fmt.Errorf("redis.address %q is not a host:port address: %w",
+			c.Redis.Address, err))
+	}
+
+	if c.Redis.Timeout <= 0 {
+		problems = append(problems, fmt.Errorf("redis.timeout must be positive"))
+	}
+
+	if c.Redis.Database < 0 {
+		problems = append(problems, fmt.Errorf("redis.database cannot be negative"))
+	}
+
+	// A cache that is slower than the directory it spares is worse than no
+	// cache: the request pays the Redis timeout and then does the bind
+	// anyway.
+	slowest := Duration(0)
+
+	for _, dir := range c.LDAP {
+		if dir.OperationTimeout > slowest {
+			slowest = dir.OperationTimeout
+		}
+	}
+
+	if slowest > 0 && c.Redis.Timeout >= slowest {
+		warnings = append(warnings, fmt.Sprintf(
+			"redis.timeout (%s) is not shorter than the slowest ldap operation_timeout (%s): "+
+				"a slow Redis would then cost more than the directory lookup it is there to avoid",
+			c.Redis.Timeout, slowest))
+	}
+
+	if c.Redis.PasswordFile == "" {
+		warnings = append(warnings, "redis.password_file is not set: the shared cache holds "+
+			"credential-derived keys and authorization decisions, so it should require authentication")
 	}
 
 	return problems, warnings

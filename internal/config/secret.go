@@ -45,6 +45,19 @@ func (c *Config) loadSecrets() (warnings []string, err error) {
 		}
 	}
 
+	if c.Redis.Enabled && c.Redis.PasswordFile != "" {
+		password, warning, err := readSecretFile(c.Redis.PasswordFile)
+		if err != nil {
+			problems = append(problems, fmt.Errorf("redis.password_file: %w", err))
+		} else {
+			c.Redis.Password = string(password)
+		}
+
+		if warning != "" {
+			warnings = append(warnings, "redis.password_file: "+warning)
+		}
+	}
+
 	for _, name := range sortedKeys(c.LDAP) {
 		dir := c.LDAP[name]
 

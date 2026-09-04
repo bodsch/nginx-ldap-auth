@@ -15,6 +15,22 @@ var (
 	// ErrMalformedCredentials means the header was present but unusable.
 	ErrMalformedCredentials = errors.New("malformed credentials")
 
+	// ErrUnsupportedUsername means the username contains characters that
+	// are only meaningful as LDAP filter metacharacters.
+	//
+	// Escaping already stops these from changing a filter's meaning. This
+	// rejects them anyway, because escaping is not the whole problem: a
+	// directory that decodes the escapes and reparses — GLAuth does — turns
+	// the escaped filter back into a malformed one and answers with a
+	// protocol error. That is not an authentication failure, so it is not
+	// counted against the throttle, so it can be repeated indefinitely, and
+	// every repetition costs a search on the single pooled service
+	// connection that every other request is queued behind.
+	//
+	// No directory permits these characters in a login name, so rejecting
+	// them costs nothing and removes the amplification entirely.
+	ErrUnsupportedUsername = errors.New("unsupported username")
+
 	// ErrEmptyPassword means the header carried a username and no password.
 	//
 	// This is its own error because it is the one failure mode that would
@@ -77,6 +93,11 @@ func ParseBasic(header string) (user, password string, err error) {
 		return "", "", fmt.Errorf("%w: username contains a control character", ErrMalformedCredentials)
 	}
 
+	if i := strings.IndexAny(user, filterMetacharacters); i >= 0 {
+		return user, "", fmt.Errorf("%w: %q is not valid in a login name",
+			ErrUnsupportedUsername, user[i:i+1])
+	}
+
 	// Checked here as well as in the LDAP client, because this is where the
 	// distinction between "no password" and "wrong password" is still
 	// available: further down it would have to be reconstructed from a
@@ -87,6 +108,10 @@ func ParseBasic(header string) (user, password string, err error) {
 
 	return user, password, nil
 }
+
+// filterMetacharacters are the characters RFC 4515 requires to be escaped in a
+// filter value. NUL is covered by the control-character check above.
+const filterMetacharacters = `*()\`
 
 // isControl reports whether r is a C0 or C1 control character.
 func isControl(r rune) bool {

@@ -850,3 +850,54 @@ func TestZeroDecisionDeniesAccess(t *testing.T) {
 			"anything that produces one by accident becomes an authentication bypass", unset.Outcome)
 	}
 }
+
+// TestInjectionAttemptIsThrottled closes the amplification path the GLAuth
+// suite exposed.
+//
+// The attempt never reaches the directory, and it counts against the throttle,
+// so a client repeating it runs out of budget instead of holding the pooled
+// service connection indefinitely.
+func TestInjectionAttemptIsThrottled(t *testing.T) {
+	throttle, err := ratelimit.New(ratelimit.Config{
+		Window:                time.Minute,
+		BlockDuration:         5 * time.Minute,
+		MaxFailuresPerUser:    0,
+		MaxFailuresPerAddress: 3,
+		MaxEntries:            10,
+	})
+	if err != nil {
+		t.Fatalf("ratelimit.New: %v", err)
+	}
+
+	h := newHarness(t, harnessOptions{
+		respond: func(string, string) (*ldap.Identity, error) {
+			t.Error("an injection attempt reached the directory")
+
+			return nil, errors.New("unreachable")
+		},
+		throttle: throttle,
+	})
+
+	// Each attempt uses a different username, so only the address limit can
+	// catch them — which is the point: an attacker varying the payload must
+	// not get a fresh budget per variation.
+	for i, user := range []string{"*", "*)(uid=*", "alice)"} {
+		result := h.request("intranet", user, "s3cret", "10.0.0.1")
+
+		if result.Status != StatusUnauthenticated {
+			t.Fatalf("attempt %d status = %s, want unauthenticated", i+1, result.Status)
+		}
+
+		if result.Reason != "unsupported_username" {
+			t.Errorf("attempt %d reason = %q, want unsupported_username", i+1, result.Reason)
+		}
+	}
+
+	if status := h.request("intranet", "(another", "s3cret", "10.0.0.1").Status; status != StatusThrottled {
+		t.Fatalf("status = %s, want throttled after three injection attempts", status)
+	}
+
+	if h.directory.Calls() != 0 {
+		t.Errorf("directory calls = %d, want 0", h.directory.Calls())
+	}
+}

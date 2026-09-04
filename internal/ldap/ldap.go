@@ -36,6 +36,10 @@ import (
 // no use for the difference either way.
 var ErrInvalidCredentials = errors.New("invalid credentials")
 
+// filterMetacharacters are the characters RFC 4515 requires to be escaped in a
+// filter value.
+const filterMetacharacters = `*()\`
+
 // maxUserEntries is the size limit of a user search.
 //
 // It is 2 rather than 1 on purpose: with a limit of 1 an ambiguous filter looks
@@ -218,6 +222,17 @@ func (c *Client) Authenticate(ctx context.Context, user, password string) (*Iden
 	// actually issues the bind.
 	if strings.TrimSpace(password) == "" {
 		return nil, fmt.Errorf("%w: empty password", ErrInvalidCredentials)
+	}
+
+	// Defence in depth, alongside the empty-password check above. The
+	// authentication path rejects these before they reach here, and
+	// escaping stops them changing a filter's meaning — but a directory
+	// that decodes the escapes and reparses turns the escaped filter back
+	// into a malformed one, and answers with a protocol error rather than a
+	// refusal. Keeping the check here means a future caller of this package
+	// cannot reintroduce that.
+	if i := strings.IndexAny(user, filterMetacharacters); i >= 0 {
+		return nil, fmt.Errorf("%w: username contains %q", ErrInvalidCredentials, user[i:i+1])
 	}
 
 	entry, err := c.findUser(user)

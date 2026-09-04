@@ -80,8 +80,14 @@ func (c *stateCollector) Collect(out chan<- prometheus.Metric) {
 		backend := c.cache.Name()
 		stats := c.cache.Stats()
 
-		out <- prometheus.MustNewConstMetric(cacheEntriesDesc,
-			prometheus.GaugeValue, float64(stats.Entries), backend)
+		// Only emitted when the backend can answer without a round
+		// trip. A gauge that requires network I/O inside Collect lets a
+		// slow cache stall the whole scrape.
+		if stats.EntriesKnown {
+			out <- prometheus.MustNewConstMetric(cacheEntriesDesc,
+				prometheus.GaugeValue, float64(stats.Entries), backend)
+		}
+
 		out <- prometheus.MustNewConstMetric(cacheRequestsDesc,
 			prometheus.CounterValue, float64(stats.Hits), backend, "hit")
 		out <- prometheus.MustNewConstMetric(cacheRequestsDesc,

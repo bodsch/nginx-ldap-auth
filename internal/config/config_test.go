@@ -298,7 +298,7 @@ ldap:
     base_dn: dc=example,dc=org`),
 			want: "no policy configured",
 		},
-		"redis is not implemented": {
+		"redis without a cache": {
 			yaml: base(`
 redis:
   enabled: true
@@ -310,7 +310,7 @@ ldap:
   primary:
     url: ldaps://dir.example.org:636
     base_dn: dc=example,dc=org`),
-			want: "not implemented yet",
+			want: "Redis is a cache backend",
 		},
 	}
 
@@ -500,6 +500,93 @@ cache:
 
 		if containsSubstring(warnings, "not implemented") {
 			t.Errorf("warnings = %q, still claim metrics are unimplemented", warnings)
+		}
+	})
+}
+
+func TestRedisValidation(t *testing.T) {
+	pepper := writeFile(t, "pepper.secret", strings.Repeat("p", 64), 0o600)
+
+	withRedis := func(redis string) string {
+		return `
+policies:
+  intranet:
+    ldap: primary
+    allow_any_user: true
+ldap:
+  primary:
+    url: ldaps://dir.example.org:636
+    base_dn: dc=example,dc=org
+    operation_timeout: 5s
+cache:
+  enabled: true
+  pepper_file: ` + pepper + `
+` + redis
+	}
+
+	t.Run("enabled and valid", func(t *testing.T) {
+		cfg, _, err := loadYAML(t, withRedis("redis:\n  enabled: true\n  address: 127.0.0.1:6379\n  timeout: 1s\n"))
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+
+		if !cfg.Redis.Enabled {
+			t.Error("redis.enabled was not read")
+		}
+	})
+
+	t.Run("bad address", func(t *testing.T) {
+		_, _, err := loadYAML(t, withRedis("redis:\n  enabled: true\n  address: not-an-address\n  timeout: 1s\n"))
+		if err == nil || !strings.Contains(err.Error(), "redis.address") {
+			t.Errorf("err = %v, want a refusal naming redis.address", err)
+		}
+	})
+
+	// A cache slower than the directory it spares is worse than no cache:
+	// the request pays the Redis timeout and then does the bind anyway.
+	t.Run("timeout not shorter than the directory's warns", func(t *testing.T) {
+		_, warnings, err := loadYAML(t, withRedis("redis:\n  enabled: true\n  address: 127.0.0.1:6379\n  timeout: 5s\n"))
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+
+		if !containsSubstring(warnings, "cost more than the directory lookup") {
+			t.Errorf("warnings = %q, want one about the timeout ordering", warnings)
+		}
+	})
+
+	// The shared cache holds credential-derived keys and authorization
+	// decisions. An unauthenticated Redis is a decision, not a default.
+	t.Run("no password warns", func(t *testing.T) {
+		_, warnings, err := loadYAML(t, withRedis("redis:\n  enabled: true\n  address: 127.0.0.1:6379\n  timeout: 1s\n"))
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+
+		if !containsSubstring(warnings, "should require authentication") {
+			t.Errorf("warnings = %q, want one about the missing password", warnings)
+		}
+	})
+
+	t.Run("password file is loaded", func(t *testing.T) {
+		password := writeFile(t, "redis.secret", "redispassword\n", 0o600)
+
+		cfg, _, err := loadYAML(t, withRedis(
+			"redis:\n  enabled: true\n  address: 127.0.0.1:6379\n  timeout: 1s\n  password_file: "+password+"\n"))
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+
+		if cfg.Redis.Password != "redispassword" {
+			t.Errorf("redis password = %q, want the file content", cfg.Redis.Password)
+		}
+	})
+
+	t.Run("missing password file refuses startup", func(t *testing.T) {
+		_, _, err := loadYAML(t, withRedis(
+			"redis:\n  enabled: true\n  address: 127.0.0.1:6379\n  timeout: 1s\n  password_file: /nonexistent\n"))
+		if err == nil || !strings.Contains(err.Error(), "redis.password_file") {
+			t.Errorf("err = %v, want a refusal naming redis.password_file", err)
 		}
 	})
 }

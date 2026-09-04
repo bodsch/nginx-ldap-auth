@@ -12,6 +12,7 @@ package cache
 
 import (
 	"context"
+	"fmt"
 	"time"
 )
 
@@ -45,8 +46,9 @@ const (
 	OutcomeUnauthorized
 )
 
-// String implements fmt.Stringer. The values double as the result label of the
-// metrics added in milestone 2, so they are stable identifiers, not prose.
+// String implements fmt.Stringer. The values double as metric label values and
+// as the wire format of a shared cache, so they are stable identifiers, not
+// prose.
 func (o Outcome) String() string {
 	switch o {
 	case OutcomeAllow:
@@ -57,6 +59,27 @@ func (o Outcome) String() string {
 		return "unauthorized"
 	default:
 		return "unknown"
+	}
+}
+
+// ParseOutcome reads an outcome back from its string form.
+//
+// A shared cache stores the name rather than the number. The numeric values
+// exist only to make the zero value a denial, and their order is therefore free
+// to change — which it already has once. Had the number been on the wire, that
+// change would have silently reinterpreted every entry written by an instance
+// running the older build, turning stored denials into grants during a rolling
+// restart.
+func ParseOutcome(name string) (Outcome, error) {
+	switch name {
+	case "allow":
+		return OutcomeAllow, nil
+	case "invalid_credentials":
+		return OutcomeInvalidCredentials, nil
+	case "unauthorized":
+		return OutcomeUnauthorized, nil
+	default:
+		return OutcomeInvalidCredentials, fmt.Errorf("unknown outcome %q", name)
 	}
 }
 
@@ -110,7 +133,13 @@ type Cache interface {
 // scrape time instead of maintaining a second copy. Two counters for one fact
 // are two counters that can drift.
 type Stats struct {
-	Entries   int
+	// Entries is only meaningful when EntriesKnown is set. A network-backed
+	// cache cannot report its size without a round trip, and doing one
+	// inside a metrics scrape would let a slow Redis stall the collection
+	// of every other metric.
+	Entries      int
+	EntriesKnown bool
+
 	Hits      uint64
 	Misses    uint64
 	Evictions uint64
@@ -139,7 +168,7 @@ func (Disabled) Set(context.Context, string, Decision, time.Duration) error {
 
 // Stats reports an empty cache.
 func (Disabled) Stats() Stats {
-	return Stats{}
+	return Stats{EntriesKnown: true}
 }
 
 // Name identifies the backend.

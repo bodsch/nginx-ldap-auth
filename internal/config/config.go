@@ -172,12 +172,22 @@ type Cache struct {
 	Pepper []byte `yaml:"-"`
 }
 
-// Redis configures the optional shared cache backend. Milestone 2.
+// Redis configures the optional shared cache backend.
+//
+// It replaces the in-process cache rather than sitting behind it. A memory tier
+// in front of Redis would serve a decision another instance had already
+// revoked, which defeats the only reason to share them.
 type Redis struct {
 	Enabled  bool     `yaml:"enabled"`
 	Address  string   `yaml:"address"`
 	Database int      `yaml:"database"`
 	Timeout  Duration `yaml:"timeout"`
+
+	// PasswordFile holds the AUTH password, if the server requires one.
+	PasswordFile string `yaml:"password_file"`
+
+	// Password is loaded from PasswordFile.
+	Password string `yaml:"-"`
 }
 
 // RateLimit configures the failure throttle.
@@ -229,6 +239,7 @@ func Defaults() *Config {
 		},
 		Redis: Redis{
 			Enabled:  false,
+			Address:  "127.0.0.1:6379",
 			Database: 0,
 			Timeout:  Duration(2 * time.Second),
 		},

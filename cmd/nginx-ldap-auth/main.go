@@ -98,19 +98,35 @@ func serve(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		return fmt.Errorf("prepare policies: %w", err)
 	}
 
-	decisionCache, keyer, err := newCache(cfg.Cache)
+	// Built before the cache, because the Redis backend reports its
+	// operation timings to it. The state collector is registered further
+	// down, once the cache and throttle exist.
+	collector, err := newMetrics(cfg, policies.Names())
+	if err != nil {
+		return fmt.Errorf("prepare metrics: %w", err)
+	}
+
+	var cacheObserver cache.Observer
+	if collector != nil {
+		cacheObserver = collector
+	}
+
+	decisionCache, keyer, closeCache, err := newCache(ctx, cfg, cacheObserver, log)
 	if err != nil {
 		return fmt.Errorf("prepare cache: %w", err)
 	}
+
+	defer closeCache()
 
 	throttle, err := newThrottle(cfg.RateLimit)
 	if err != nil {
 		return fmt.Errorf("prepare throttle: %w", err)
 	}
 
-	collector, err := newMetrics(cfg, policies.Names(), decisionCache, throttle)
-	if err != nil {
-		return fmt.Errorf("prepare metrics: %w", err)
+	if collector != nil {
+		if err := collector.RegisterState(decisionCache, throttle); err != nil {
+			return fmt.Errorf("register state metrics: %w", err)
+		}
 	}
 
 	// A nil *metrics.Metrics would satisfy the observer interfaces and then
@@ -219,12 +235,7 @@ func runListeners(ctx context.Context, listeners []func(context.Context) error) 
 }
 
 // newMetrics builds the metric set, or returns nil when metrics are disabled.
-func newMetrics(
-	cfg *config.Config,
-	policyNames []string,
-	decisionCache cache.Cache,
-	throttle ratelimit.Throttle,
-) (*metrics.Metrics, error) {
+func newMetrics(cfg *config.Config, policyNames []string) (*metrics.Metrics, error) {
 	if !cfg.Metrics.Enabled {
 		return nil, nil
 	}
@@ -245,39 +256,67 @@ func newMetrics(
 		timeouts = append(timeouts, cfg.Redis.Timeout.Duration())
 	}
 
-	collector, err := metrics.New(metrics.Options{
+	return metrics.New(metrics.Options{
 		Version:  version,
 		Policies: policyNames,
 		Timeouts: timeouts,
 	})
-	if err != nil {
-		return nil, err
-	}
-
-	if err := collector.RegisterState(decisionCache, throttle); err != nil {
-		return nil, err
-	}
-
-	return collector, nil
 }
 
-// newCache returns the decision cache and the keyer that derives its keys.
-func newCache(cfg config.Cache) (cache.Cache, *cache.Keyer, error) {
-	if !cfg.Enabled {
-		return cache.Disabled{}, nil, nil
+// newCache returns the decision cache, the keyer that derives its keys, and a
+// function to release it.
+func newCache(
+	ctx context.Context,
+	cfg *config.Config,
+	observer cache.Observer,
+	log *slog.Logger,
+) (decisionCache cache.Cache, keyer *cache.Keyer, release func(), err error) {
+	release = func() {}
+
+	if !cfg.Cache.Enabled {
+		return cache.Disabled{}, nil, release, nil
 	}
 
-	keyer, err := cache.NewKeyer(cfg.Pepper)
+	keyer, err = cache.NewKeyer(cfg.Cache.Pepper)
 	if err != nil {
-		return nil, nil, fmt.Errorf("cache keyer: %w", err)
+		return nil, nil, release, fmt.Errorf("cache keyer: %w", err)
 	}
 
-	memory, err := cache.NewMemory(cfg.MaxEntries)
+	if !cfg.Redis.Enabled {
+		memory, err := cache.NewMemory(cfg.Cache.MaxEntries)
+		if err != nil {
+			return nil, nil, release, err
+		}
+
+		return memory, keyer, release, nil
+	}
+
+	shared, err := cache.NewRedis(cache.RedisOptions{
+		Address:  cfg.Redis.Address,
+		Database: cfg.Redis.Database,
+		Password: cfg.Redis.Password,
+		Timeout:  cfg.Redis.Timeout.Duration(),
+		Observer: observer,
+	})
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, release, err
 	}
 
-	return memory, keyer, nil
+	// Reported, never fatal. An unreachable shared cache costs LDAP binds
+	// and nothing else, and refusing to start over it would turn a cache
+	// outage into a site outage — which is the failure this whole design
+	// exists to avoid.
+	if err := shared.Ping(ctx); err != nil {
+		log.Warn("shared cache is not reachable; authenticating against the directory directly",
+			slog.String("address", cfg.Redis.Address),
+			slog.String("error", err.Error()))
+	}
+
+	return shared, keyer, func() {
+		if err := shared.Close(); err != nil {
+			log.Debug("close shared cache", slog.String("error", err.Error()))
+		}
+	}, nil
 }
 
 // newThrottle returns the failure throttle.
@@ -332,6 +371,7 @@ func logStartup(log *slog.Logger, cfg *config.Config, policies *policy.Set, deci
 		slog.String("default_policy", policies.DefaultName()),
 		slog.Int("directories", len(cfg.LDAP)),
 		slog.String("cache", decisionCache.Name()),
+		slog.Bool("cache_shared", cfg.Redis.Enabled),
 		slog.String("cache_ttl", cfg.Cache.TTL.String()),
 		slog.String("negative_ttl", cfg.Cache.NegativeTTL.String()),
 		slog.Bool("throttle", cfg.RateLimit.Enabled),

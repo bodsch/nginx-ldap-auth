@@ -243,10 +243,12 @@ func (a *Authenticator) Authenticate(ctx context.Context, req Request) Result {
 		// An unparsable header is not a password guess, so it does not
 		// count towards the throttle: it carries no username to charge
 		// and counting it would let unrelated clients block each other.
-		// An empty password is a guess — the cheapest possible attempt
-		// at an anonymous-bind bypass — and leaving it uncounted would
-		// make it the free one.
-		if errors.Is(err, ErrEmptyPassword) {
+		//
+		// The two that are counted both are guesses. An empty password
+		// is the cheapest possible attempt at an anonymous-bind bypass;
+		// a username full of filter metacharacters is an injection
+		// attempt. Leaving either uncounted would make it the free one.
+		if errors.Is(err, ErrEmptyPassword) || errors.Is(err, ErrUnsupportedUsername) {
 			a.throttle.RecordFailure(user, req.RemoteAddress)
 		}
 
@@ -425,6 +427,8 @@ func credentialReason(err error) string {
 		return "no_credentials"
 	case errors.Is(err, ErrEmptyPassword):
 		return "empty_password"
+	case errors.Is(err, ErrUnsupportedUsername):
+		return "unsupported_username"
 	default:
 		return "malformed_credentials"
 	}

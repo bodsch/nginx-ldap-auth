@@ -131,6 +131,7 @@ func (m *Memory) Stats() Stats {
 
 	stats := m.stats
 	stats.Entries = m.order.Len()
+	stats.EntriesKnown = true
 
 	return stats
 }

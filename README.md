@@ -14,12 +14,11 @@ question: may this request through?
 
 ## Status
 
-Milestone 1 complete, milestone 2 in progress.
+Milestone 1 complete. Milestone 2 complete except the Arch Linux PKGBUILD.
 
-Working and covered by tests: authentication, authorization, caching,
-throttling, and Prometheus metrics. Still open from milestone 2: the shared
-Redis cache backend, the integration suite against a real directory, and the
-Arch Linux PKGBUILD — see [project.md](project.md) §21.
+Working and covered by tests: authentication, authorization, the in-process and
+the shared Redis cache, throttling, Prometheus metrics, and an integration suite
+against a real GLAuth directory. See [project.md](project.md) §21.
 
 ## Install
 
@@ -198,6 +197,12 @@ The ones that are deliberate rather than incidental:
   `502`, and it is not counted against the user — throttling on infrastructure
   errors would lock out every account for the block duration after the outage
   ended.
+- **Usernames containing filter metacharacters are refused before any directory
+  operation.** Escaping them is correct and not sufficient: a directory that
+  decodes the escapes and reparses — GLAuth does — answers with a protocol
+  error, which is an infrastructure error, which is deliberately not throttled,
+  which makes it repeatable for free. Each repetition costs a search on the one
+  pooled connection every other request queues behind.
 - **A failing cache is a miss, never a decision.** A read error falls through to
   the directory in both directions: if it denied, a Redis restart would log
   everybody out of every protected site; if it granted, a Redis restart would
@@ -271,18 +276,32 @@ make cover     # coverage summary
 make vuln      # govulncheck
 ```
 
-`internal/ldap` still has the lowest coverage on purpose: its search and group
-paths need a directory that speaks LDAP, and that is what the milestone 2
-integration suite adds — GLAuth started from `TestMain` with a fixture, no
-Docker required. What is covered without one is the part that matters most:
-filter escaping, TLS verification (against a real TLS listener), and the
-empty-password refusal.
+### The integration suite
 
-Three promises stay structurally unverified until that suite exists, and all
-three are protocol-level: that a user filter matching two entries is refused
-rather than guessed, that a dropped service connection is retried exactly once,
-and that a connection is never reused across users. They are listed here so the
-next person does not have to rediscover which claims are still on trust.
+```sh
+go install github.com/glauth/glauth/v2@latest
+make integration
+```
+
+It starts a real GLAuth per test on a free port, using the fixture in
+`testdata/glauth/`. No container, no shared environment. Without the binary it
+skips and says how to get it — so a run without GLAuth is still green, it just
+makes no claim about the paths only a directory can settle.
+
+That suite is what verifies the three properties nothing else could: that a
+filter matching two entries is refused rather than guessed, that a dropped
+service connection is retried once, and that a user bind never lands on the
+pooled connection. The last one is observable because an ordinary user in the
+fixture has no search capability — so a leaked bind breaks the *next* request.
+
+It also found a defect no unit test could: escaping the username correctly is
+not sufficient, because a directory that decodes the escapes and reparses
+answers with a protocol error rather than a refusal — an unthrottled request
+that costs a search on the pooled connection every time.
+
+The Redis backend is tested against a real RESP server on a real socket.
+`NGINX_LDAP_AUTH_REDIS_ADDR=127.0.0.1:6379` runs the same assertions against a
+real Redis.
 
 ## Design
 

@@ -213,3 +213,44 @@ func TestCredentialReason(t *testing.T) {
 		}
 	}
 }
+
+// TestParseBasicRejectsFilterMetacharacters is the fix for what the GLAuth
+// integration suite found.
+//
+// Escaping stops these from changing a filter's meaning, and that is not the
+// whole problem: a directory that decodes the escapes and reparses — GLAuth
+// does — answers the escaped filter with a protocol error rather than a
+// refusal. A protocol error is an infrastructure error, so it is deliberately
+// not counted against the throttle, so it can be repeated indefinitely, and
+// every repetition costs a search on the single pooled service connection every
+// other request queues behind.
+func TestParseBasicRejectsFilterMetacharacters(t *testing.T) {
+	for _, user := range []string{"*", "*)(uid=*", "alice)", "(alice", `back\slash`, "ali*ce"} {
+		_, _, err := ParseBasic(basicHeader(user, "s3cret"))
+
+		if !errors.Is(err, ErrUnsupportedUsername) {
+			t.Errorf("username %q: err = %v, want ErrUnsupportedUsername", user, err)
+		}
+	}
+}
+
+// TestParseBasicAcceptsOrdinaryUsernames is the guard on the rejection above.
+//
+// Rejecting characters outright is only safe if nothing a real login name uses
+// is in the set. These have to keep working, and the list is deliberately
+// awkward: dots, plus-tags, non-ASCII, and an address-shaped name.
+func TestParseBasicAcceptsOrdinaryUsernames(t *testing.T) {
+	for _, user := range []string{
+		"alice", "first.last", "user-name", "user_name", "user+tag", "USER",
+		"üser", "a@example.org", "user123", "DOMAIN¥user",
+	} {
+		got, _, err := ParseBasic(basicHeader(user, "s3cret"))
+		if err != nil {
+			t.Errorf("username %q was rejected: %v", user, err)
+		}
+
+		if got != user {
+			t.Errorf("username = %q, want %q", got, user)
+		}
+	}
+}

@@ -39,8 +39,13 @@ policies:
 
     # Access requires membership in at least one of these. Both the full DN and
     # the short name are accepted, and both are compared case-insensitively.
+    #
+    # The short name is the portable choice. A full DN has to match the RDN
+    # attribute the directory actually uses, and that varies: GLAuth names
+    # groups ou=web-users,ou=groups,... while an OpenLDAP posixGroup would be
+    # cn=web-users,ou=groups,... A short name matches either.
     require_groups:
-      - cn=web-users,ou=groups,dc=example,dc=org
+      - web-users
 
   monitoring:
     realm: "Monitoring"
@@ -67,18 +72,27 @@ ldap:
     # client typed, is what reaches the upstream application.
     user_attribute: uid
 
-    # Group resolution. Use group_filter for member/memberUid schemas, or
+    # Group resolution. Use group_filter for member-style schemas, or
     # group_attribute for memberOf schemas — one or the other, never both.
+    #
+    # These values are the ones that work against GLAuth, verified by the
+    # integration suite. GLAuth exposes groups as groupOfUniqueNames with a
+    # uniqueMember attribute holding full DNs; it does not expose posixGroup or
+    # memberUid, so the filter every other example uses matches nothing there.
     group_base_dn: ou=groups,dc=example,dc=org
-    group_filter: "(&(objectClass=posixGroup)(memberUid=%s))"
+    group_filter: "(&(objectClass=groupOfUniqueNames)(uniqueMember=%s))"
 
     # What %s in group_filter is filled with: "user" or "dn".
-    group_filter_value: user
+    group_filter_value: dn
 
     # The attribute reported as the group's name.
     group_name_attribute: cn
 
-    # memberOf style alternative:
+    # For OpenLDAP with posixGroup, which stores login names rather than DNs:
+    # group_filter: "(&(objectClass=posixGroup)(memberUid=%s))"
+    # group_filter_value: user
+
+    # memberOf style alternative, which works against GLAuth too:
     # group_attribute: memberOf
 
     # Service account for the user and group searches. Both keys or neither;
@@ -123,13 +137,27 @@ cache:
   #   chmod 0640 /etc/nginx-ldap-auth/cache-pepper.secret
   pepper_file: /etc/nginx-ldap-auth/cache-pepper.secret
 
-# Shared cache for several instances. Not implemented yet (milestone 2);
-# enabling it refuses startup rather than silently caching per process.
+# Shared decision cache, for several instances that should see each other's
+# decisions. It replaces the in-process cache rather than sitting behind it: a
+# memory tier in front of Redis would keep serving a decision another instance
+# had already revoked, which defeats the only reason to share them.
+#
+# For a single service this is strictly worse than the default — a network hop
+# per request and a second daemon to keep alive — so leave it off unless you
+# actually run more than one instance.
+#
+# Keep the timeout well below the directory's operation_timeout. A cache slower
+# than the lookup it spares costs the timeout and then does the lookup anyway.
+#
+# The database holds credential-derived keys and authorization decisions, so it
+# should require authentication and should not be shared with other users of
+# the same Redis.
 redis:
   enabled: false
   address: 127.0.0.1:6379
   database: 3
-  timeout: 2s
+  timeout: 1s
+  # password_file: /etc/nginx-ldap-auth/redis.secret
 
 # Failure throttle. Counts failures per username and per source address, and
 # answers 429 without touching the directory once a limit is reached.

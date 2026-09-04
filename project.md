@@ -237,6 +237,12 @@ Each policy references exactly one directory. The earlier list form was dropped 
 
 All user-supplied values must be escaped with `ldap.EscapeFilter` before interpolation. The same applies to values interpolated into `group_filter` or into any DN template.
 
+Escaping is necessary and not sufficient. A directory that decodes the escapes and recompiles the filter — GLAuth does — turns the correctly escaped filter back into a malformed one and answers with a protocol error rather than a refusal. A protocol error is an infrastructure error, so it is deliberately not counted against the throttle (section 12), so it can be repeated indefinitely, and every repetition costs a search on the single pooled service connection that every other request queues behind.
+
+A username containing any of `*`, `(`, `)`, `\` or a NUL byte is therefore rejected before any directory work happens, and counted as a failure. No directory permits these in a login name, so the restriction costs nothing; the escaping stays as defence in depth, and because group filters legitimately interpolate DNs, which do contain backslashes.
+
+This was found by the integration suite, not by reasoning about the code. The unit test asserted the escaped string was correct, and it was.
+
 ### Connection handling
 
 A successful bind changes the authentication state of the connection, so a connection must never be reused across users without an intervening rebind.
@@ -249,6 +255,16 @@ The intended split is:
 This keeps pooling where it is safe and avoids the class of bug where one request inherits the previous request's identity. `go-ldap` provides no connection pool, so the pooling is the service's own responsibility, including revalidation of an idle connection before use.
 
 The implementation must not assume a particular GLAuth schema beyond what is explicitly configured.
+
+### The GLAuth schema, as it actually is
+
+GLAuth compatibility is a design goal in section 1, and the integration suite established what that requires. Recorded here because it is not what an intuitive reading of the schema suggests, and two of these were wrong in the example configuration until the suite ran:
+
+- Users live at `cn=<name>,ou=<primary group>,ou=users,<base>` and carry both `cn` and `uid`.
+- Groups are `groupOfUniqueNames` with a `uniqueMember` attribute holding full DNs. GLAuth exposes neither `posixGroup` nor `memberUid`, so the filter most examples use — `(&(objectClass=posixGroup)(memberUid=%s))` — matches nothing against it. The working filter is `(&(objectClass=groupOfUniqueNames)(uniqueMember=%s))` with `group_filter_value: dn`.
+- Group DNs use `ou=` as the RDN attribute, not `cn=`: `ou=web-users,ou=groups,<base>`. A `require_groups` entry written as a full `cn=...` DN therefore does not match. Short names match either spelling and are the portable choice.
+- `memberOf` is exposed on the user entry and carries the same `ou=`-prefixed DNs, so both group sources work and both resolve to the same short name.
+- Searching requires an explicit `capabilities` entry on the user. An ordinary user cannot search, which is the same split a real deployment has — and what makes the pooled-service-connection design observable from outside.
 
 ## 6. Caching
 
@@ -271,15 +287,22 @@ cache:
 
 ### Redis (optional)
 
-Redis is only useful when several instances should share decisions. It is disabled by default.
+Redis is only useful when several instances should share decisions. It is disabled by default, and it replaces the in-process cache rather than sitting behind it: a memory tier in front of Redis would keep serving a decision another instance had already revoked, which defeats the only reason to share them.
 
 ```yaml
 redis:
   enabled: false
   address: 127.0.0.1:6379
   database: 3
-  timeout: 2s
+  timeout: 1s
+  password_file: /etc/nginx-ldap-auth/redis.secret
 ```
+
+The timeout must stay well below the directory's `operation_timeout`. A cache slower than the lookup it spares costs the timeout and then does the lookup anyway; startup warns when the two are the wrong way round.
+
+An unreachable Redis is reported at startup and never refuses it. The cost of a cache outage is LDAP binds, and refusing to start would turn it into a site outage.
+
+The stored value carries the outcome **by name**, not by its numeric value. The numbers exist only so that the zero value denies, and their order has already changed once — with the number on the wire, that change would have reinterpreted every entry written by an instance still running the older build, turning stored denials into grants for as long as the two versions overlapped. An entry that cannot be decoded, for any reason including an outcome name this build does not know, is treated as a miss.
 
 ### Key derivation
 
@@ -655,6 +678,7 @@ Security is a primary design requirement.
 - Never fail open when LDAP or Redis is unavailable.
 - Empty or whitespace-only passwords are rejected before any LDAP operation.
 - All user-supplied values are escaped per RFC 4515 before filter interpolation.
+- Usernames containing `*`, `(`, `)`, `\` or NUL are rejected before any directory operation, and counted as a failure. Escaping alone leaves an unthrottled amplification path against directories that decode the escapes and reparse — see section 5.
 - Never reuse an LDAP connection across users without an intervening rebind.
 - Reject requests whose `X-Auth-Policy` does not name a configured policy.
 - Throttle repeated authentication failures per username and per source address.
@@ -832,6 +856,10 @@ gopkg.in/yaml.v3
 
 Everything else should use the Go standard library. In particular the in-process cache, the failure throttle, the HMAC key derivation and the JSON logging need no third-party package — `crypto/hmac`, `crypto/sha256` and `log/slog` cover all of it.
 
+One further module, `github.com/alicebob/miniredis/v2`, is imported only from test files and is not linked into the binary — `go version -m` on the built artefact lists neither it nor its own dependencies. It is a real RESP server rather than a mock of the Redis client, which is what makes the shared-cache tests exercise the protocol instead of exercising a stub. `go.mod` cannot express "test only", so it appears in the require block; the property that matters is verifiable from the binary.
+
+GLAuth is not a module dependency at all. The integration suite runs it as a separate process, and skips when it is absent.
+
 No subprocess execution should be required at runtime.
 
 No Node.js runtime should be required.
@@ -862,22 +890,32 @@ At minimum:
 
 ### Integration tests
 
-GLAuth is a single static binary with a plain configuration file. Integration tests start it from `TestMain` on a random port using the fixture in `testdata/glauth/`, which covers the real LDAP path without Docker and without a shared test environment.
+GLAuth is a single static binary with a plain configuration file, which is why it is the backend this service targets. The suite starts it per test on a free port using the fixture in `testdata/glauth/`, so it needs no container, no shared test environment, and no fixture that merely resembles LDAP.
 
-Cases:
+```sh
+go install github.com/glauth/glauth/v2@latest
+make integration
+```
 
-- valid and invalid credentials against GLAuth
-- empty password rejected before a bind reaches GLAuth
-- username containing LDAP filter metacharacters
-- group authorization, allow and deny
-- unknown policy name
-- LDAP outage: GLAuth stopped mid-test
-- cache hit skips LDAP, asserted through the LDAP request counter
-- Redis outage falls through to LDAP
-- throttle engages after the configured failure count
-- nginx `auth_request` integration where an nginx binary is available, skipped otherwise
+Without the binary the suite skips rather than failing, and the skip message says how to get it. A developer without GLAuth still gets a green run of everything else; what they do not get is any claim about the paths only a directory can exercise.
 
-The "no external process execution" design goal in section 1 applies to the running service, not to the test harness. A dedicated test environment may use containers if useful, but containers must not be a runtime requirement.
+The cases that only a real directory can settle, and what each one is for:
+
+| Case | Why a fake could not answer it |
+|---|---|
+| Valid credentials, wrong password, unknown user | The refusals have to be indistinguishable to the client, and that is the directory's answer, not ours |
+| Empty password | Whether an anonymous bind succeeds is the directory's decision; the assertion is that it is never asked |
+| Filter injection | Escaping can be correct and still not be enough — see section 5 |
+| Ambiguous user filter | Two entries sharing an attribute is provoked from the fixture, not constructed |
+| Group resolution, both sources | The real schema is not the one its documentation suggests |
+| Directory stopped mid-run | An established connection going away is not the same failure as a closed port |
+| Service connection reuse | One service bind across three authentications is only observable from the directory's side |
+| User bind isolation | An ordinary user in the fixture cannot search, so a bind leaking onto the pooled connection breaks the *next* request — which is how the property becomes testable at all |
+| Reconnect after a drop | Directories close idle connections; restarting GLAuth under a live client reaches that state faster |
+
+The Redis backend is covered separately, against a real RESP server on a real socket rather than a mocked client. `NGINX_LDAP_AUTH_REDIS_ADDR` points the same assertions at a real Redis.
+
+The "no external process execution" design goal in section 1 applies to the running service, not to the test harness.
 
 ## 18. Operational behavior
 
@@ -910,6 +948,7 @@ Named policies, group authorization and failure throttling were moved out of thi
 Potential future features:
 
 - multiple LDAP backends with explicitly defined failover semantics
+- a short-lived memory tier in front of Redis, if the per-request round trip ever matters more than seeing a revocation immediately
 - LDAP group-to-role mapping
 - Unix domain socket support
 - configuration reload without restart
@@ -956,9 +995,9 @@ The goal is a small authentication component that fills the gap between nginx an
 
 ### Milestone 2 — operability
 
-1. Prometheus metrics and `/metrics`
-2. Redis cache backend
-3. Integration tests against a GLAuth binary
+1. ~~Prometheus metrics and `/metrics`~~
+2. ~~Redis cache backend~~
+3. ~~Integration tests against a GLAuth binary~~
 4. Arch Linux PKGBUILD
 
 Metrics, Redis and the integration suite were moved out of the first milestone deliberately. None of them changes whether the service authenticates correctly, and the original seventeen-point milestone was not the "intentionally small" first step it claimed to be.

@@ -11,7 +11,7 @@ UNITDIR     ?= /usr/lib/systemd/system
 GOFLAGS  := -trimpath
 LDFLAGS  := -s -w -X main.version=$(VERSION)
 
-.PHONY: all build test test-race cover lint vet vuln fmt tidy check install clean
+.PHONY: all build test test-race integration cover lint vet vuln fmt tidy check install clean
 
 all: build
 
@@ -23,6 +23,15 @@ test:
 
 test-race:
 	go test -race ./...
+
+# The integration suite needs a GLAuth binary. It skips without one, so this
+# target adds GOPATH/bin to PATH and says what to install if it is still not
+# found. The Redis assertions run against an in-process RESP server; point them
+# at a real one with NGINX_LDAP_AUTH_REDIS_ADDR.
+integration:
+	@command -v glauth >/dev/null 2>&1 || test -x "$(shell go env GOPATH)/bin/glauth" || \
+		echo "note: glauth not found; install it with 'go install github.com/glauth/glauth/v2@latest'"
+	PATH="$(shell go env GOPATH)/bin:$$PATH" go test -race -run Integration -count=1 ./internal/ldap/
 
 cover:
 	go test -coverprofile=coverage.out ./...
@@ -44,7 +53,7 @@ tidy:
 	go mod tidy
 
 # What CI runs, and what to run before pushing.
-check: vet test-race lint
+check: vet test-race integration lint
 
 install: build
 	install -Dm0755 bin/$(BINARY) $(DESTDIR)$(PREFIX)/bin/$(BINARY)

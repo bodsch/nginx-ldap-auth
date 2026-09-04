@@ -70,6 +70,7 @@ var knownReasons = map[string]struct{}{
 	"no_credentials":        {},
 	"empty_password":        {},
 	"malformed_credentials": {},
+	"unsupported_username":  {},
 	ReasonPolicyUnresolved:  {},
 	"throttled_user":        {},
 	"throttled_address":     {},
