@@ -31,6 +31,15 @@ var cookieNamePattern = regexp.MustCompile(`^[A-Za-z0-9!#$%&'*+\-.^_` + "`" + `|
 // HTML page and a 200.
 var reservedPaths = []string{"/auth", "/healthz", "/readyz"}
 
+// containerAttributes are attribute names that describe where an entry sits
+// rather than who it is.
+//
+// Pointing user_attribute at one of these is the mistake that cannot be seen
+// from the outside: the bind succeeds, the groups resolve, access is granted —
+// and every user arrives at the application under the name of their container,
+// so the application cannot tell them apart.
+var containerAttributes = []string{"ou", "o", "dc", "c", "memberof", "objectclass"}
+
 // longSessionLifetime is where an absolute timeout stops being a working day
 // and starts being a credential.
 const longSessionLifetime = 24 * time.Hour
@@ -204,6 +213,17 @@ func (d *LDAP) validate(prefix string) (problems []error, warnings []string) {
 
 	if d.UserAttribute == "" {
 		problems = append(problems, fmt.Errorf("%s.user_attribute must be set", prefix))
+	} else if slices.Contains(containerAttributes, strings.ToLower(d.UserAttribute)) {
+		// Warned about rather than refused: the check is a guess about what
+		// a directory means by an attribute name, and a directory is free
+		// to disagree. It is worth making anyway, because the failure is
+		// silent — everything authenticates, everything is authorized, and
+		// the only symptom is that the application sees one user.
+		warnings = append(warnings, fmt.Sprintf(
+			"%s.user_attribute is %q, which usually holds the container or group an entry lives in "+
+				"rather than its login name; every user would then reach the application as the same "+
+				"X-Auth-User. The login attribute is uid on OpenLDAP and sAMAccountName on Active Directory",
+			prefix, d.UserAttribute))
 	}
 
 	problems = append(problems, d.validateGroupSource(prefix)...)

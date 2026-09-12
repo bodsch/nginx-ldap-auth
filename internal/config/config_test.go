@@ -810,3 +810,49 @@ cache:
 		}
 	})
 }
+
+// A user_attribute pointing at a container attribute authenticates, authorizes
+// and grants access — and hands every user to the application under the same
+// name, so the application cannot tell two people apart. Nothing else in the
+// system reports it: the only visible symptom is a log line naming a container.
+func TestUserAttributeContainerWarning(t *testing.T) {
+	withAttribute := func(attribute string) string {
+		return `
+policies:
+  intranet:
+    ldap: primary
+    allow_any_user: true
+ldap:
+  primary:
+    url: ldaps://dir.example.org:636
+    base_dn: dc=example,dc=org
+    user_attribute: ` + attribute + `
+cache:
+  enabled: false
+`
+	}
+
+	for _, attribute := range []string{"ou", "OU", "memberOf", "objectClass", "dc"} {
+		_, warnings, err := loadYAML(t, withAttribute(attribute))
+		if err != nil {
+			t.Fatalf("Load with user_attribute %q: %v", attribute, err)
+		}
+
+		if !containsSubstring(warnings, "same X-Auth-User") {
+			t.Errorf("user_attribute %q produced no warning: %q", attribute, warnings)
+		}
+	}
+
+	// The attributes that actually carry a login name must stay silent, or
+	// the warning becomes noise that operators learn to scroll past.
+	for _, attribute := range []string{"uid", "sAMAccountName", "cn", "userPrincipalName", "mail"} {
+		_, warnings, err := loadYAML(t, withAttribute(attribute))
+		if err != nil {
+			t.Fatalf("Load with user_attribute %q: %v", attribute, err)
+		}
+
+		if containsSubstring(warnings, "same X-Auth-User") {
+			t.Errorf("user_attribute %q was warned about: %q", attribute, warnings)
+		}
+	}
+}
