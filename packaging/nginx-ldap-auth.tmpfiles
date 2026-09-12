@@ -13,4 +13,5 @@ d /etc/nginx-ldap-auth                          0750 root nginx-ldap-auth -
 z /etc/nginx-ldap-auth/config.yaml              0640 root nginx-ldap-auth -
 z /etc/nginx-ldap-auth/cache-pepper.secret      0640 root nginx-ldap-auth -
 z /etc/nginx-ldap-auth/ldap-bind.secret         0640 root nginx-ldap-auth -
+z /etc/nginx-ldap-auth/session.secret           0640 root nginx-ldap-auth -
 z /etc/nginx-ldap-auth/redis.secret             0640 root nginx-ldap-auth -

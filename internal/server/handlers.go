@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -12,13 +13,24 @@ import (
 
 	"bodsch.me/nginx-ldap-auth/internal/auth"
 	"bodsch.me/nginx-ldap-auth/internal/policy"
+	"bodsch.me/nginx-ldap-auth/internal/session"
 )
 
 // Response headers carrying the authenticated identity upstream.
 const (
 	HeaderUser   = "X-Auth-User"
 	HeaderGroups = "X-Auth-Groups"
+
+	// HeaderLoginURL is set on a 401 while sessions are enabled, so that
+	// nginx can redirect to the login form without the path being written
+	// down a second time in its configuration. Two copies of a path is one
+	// copy that gets changed.
+	HeaderLoginURL = "X-Auth-Login-URL"
 )
+
+// HeaderOriginalURI is the header nginx uses to pass on the address the client
+// actually asked for. It is what the login form sends the user back to.
+const HeaderOriginalURI = "X-Original-URI"
 
 // maxIdentityHeaderBytes bounds the identity headers.
 //
@@ -36,21 +48,91 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request) {
 	// method it uses is not part of the authentication question; rejecting
 	// one would only add a way for a working configuration to break after
 	// an nginx upgrade.
-	result := s.auth.Authenticate(r.Context(), auth.Request{
-		PolicyHeader:  r.Header.Get(policy.Header),
-		Authorization: r.Header.Get("Authorization"),
-		RemoteAddress: s.clientAddress(r),
-	})
+	result := s.decide(w, r)
 
 	elapsed := time.Since(started)
 
-	s.writeAuthResponse(w, result)
+	s.writeAuthResponse(w, r, result)
 	s.logDecision(r, result, elapsed)
 	s.observer.ObserveAuth(result.Policy, result.Status, result.Reason, elapsed)
 }
 
+// decide answers the authorization question, from the session cookie where
+// there is one and from the credentials otherwise.
+//
+// The order is what makes a session worth having: a valid cookie is answered
+// without touching the throttle, the cache or the directory, which is the whole
+// difference between one bind per login and one per HTTP request.
+func (s *Server) decide(w http.ResponseWriter, r *http.Request) auth.Result {
+	credentials := auth.Request{
+		PolicyHeader:  r.Header.Get(policy.Header),
+		Authorization: r.Header.Get("Authorization"),
+		RemoteAddress: s.clientAddress(r),
+	}
+
+	if s.sessions == nil {
+		return s.auth.Authenticate(r.Context(), credentials)
+	}
+
+	// Resolved here as well as inside the authenticator, because a cookie
+	// is only valid for the policy it was issued for and that comparison
+	// needs the name. An unresolvable policy is handed on unchanged, so
+	// that the refusal keeps coming from one place.
+	entry, err := s.auth.ResolvePolicy(credentials.PolicyHeader)
+	if err != nil {
+		return s.auth.Authenticate(r.Context(), credentials)
+	}
+
+	result := auth.Result{Policy: entry.Name(), Realm: entry.Realm()}
+
+	sess, sessionErr := s.sessions.manager.Load(r, entry.Name())
+	if sessionErr == nil {
+		result.Status = auth.StatusAllow
+		result.Reason = "session"
+		result.User = sess.User
+		result.Groups = sess.Groups
+
+		// The sliding window moves here, on the request that proves the
+		// session is still in use. nginx has to be told to pass the
+		// resulting Set-Cookie back to the client; without that the
+		// session still works, but only until the absolute timeout.
+		if _, refreshed := s.sessions.manager.Refresh(w, sess); refreshed {
+			result.Reason = "session_refreshed"
+		}
+
+		return result
+	}
+
+	// Credentials are only consulted when there are some. Falling through
+	// to the authenticator with an empty header would answer with
+	// "no_credentials" and hide why the session was not accepted, which is
+	// the one thing the log is needed for here.
+	if strings.TrimSpace(credentials.Authorization) != "" {
+		if !s.sessions.allowBasic {
+			result.Status = auth.StatusUnauthenticated
+			result.Reason = "basic_not_allowed"
+			result.Err = errBasicNotAllowed
+
+			return result
+		}
+
+		return s.auth.Authenticate(r.Context(), credentials)
+	}
+
+	result.Status = auth.StatusUnauthenticated
+	result.Reason = session.Reason(sessionErr)
+	result.Err = sessionErr
+
+	return result
+}
+
+// errBasicNotAllowed explains a refusal that has no other diagnosis: the
+// request carried perfectly well-formed credentials that this configuration
+// does not accept.
+var errBasicNotAllowed = errors.New("basic authentication is disabled by session.allow_basic")
+
 // writeAuthResponse turns a decision into the response nginx evaluates.
-func (s *Server) writeAuthResponse(w http.ResponseWriter, result auth.Result) {
+func (s *Server) writeAuthResponse(w http.ResponseWriter, r *http.Request, result auth.Result) {
 	switch result.Status {
 	case auth.StatusAllow:
 		if result.User != "" {
@@ -67,7 +149,20 @@ func (s *Server) writeAuthResponse(w http.ResponseWriter, result auth.Result) {
 		// The challenge is what makes a browser prompt. Without it a
 		// 401 is a dead end for the user, and nginx passes the header
 		// through to the client unchanged.
-		w.Header().Set("WWW-Authenticate", challenge(result.Realm))
+		//
+		// With sessions enabled it is exactly what must not be sent: the
+		// browser would open its own password dialog instead of
+		// following nginx's redirect to the login form, and the
+		// credentials it caches there never expire — which is the
+		// problem the session cookie exists to solve. Basic
+		// Authentication still works for a client that sends it
+		// unprompted, which is every client that cannot use a cookie.
+		if s.sessions == nil {
+			w.Header().Set("WWW-Authenticate", challenge(result.Realm))
+		} else {
+			w.Header().Set(HeaderLoginURL, s.sessions.loginURL(r.Header.Get(HeaderOriginalURI)))
+		}
+
 		http.Error(w, "authentication required\n", http.StatusUnauthorized)
 
 	case auth.StatusForbidden:

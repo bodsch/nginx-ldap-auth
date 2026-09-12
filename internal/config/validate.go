@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/go-ldap/ldap/v3"
 )
@@ -18,6 +19,21 @@ import (
 // what makes the header value safe to echo: an unknown name is rejected before
 // it is used anywhere, and a known name can only be one of these.
 var policyNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
+
+// cookieNamePattern is RFC 6265's token production, minus the characters Go's
+// cookie writer would silently drop. A name outside it produces a Set-Cookie
+// header the browser ignores, which presents as a login that never sticks.
+var cookieNamePattern = regexp.MustCompile(`^[A-Za-z0-9!#$%&'*+\-.^_` + "`" + `|~]{1,64}$`)
+
+// reservedPaths are the endpoints the service already serves. A login form
+// configured onto one of them would shadow it, and the one it is most likely to
+// shadow is /auth — which would answer every authorization subrequest with an
+// HTML page and a 200.
+var reservedPaths = []string{"/auth", "/healthz", "/readyz"}
+
+// longSessionLifetime is where an absolute timeout stops being a working day
+// and starts being a credential.
+const longSessionLifetime = 24 * time.Hour
 
 // validate checks the whole configuration and reports every problem it finds
 // at once. An operator fixing a config file should not have to restart the
@@ -36,6 +52,10 @@ func (c *Config) validate() (warnings []string, err error) {
 	warnings = append(warnings, dirWarnings...)
 
 	problems = append(problems, c.validatePolicies()...)
+
+	sessionProblems, sessionWarnings := c.validateSession()
+	problems = append(problems, sessionProblems...)
+	warnings = append(warnings, sessionWarnings...)
 
 	cacheProblems, cacheWarnings := c.validateCache()
 	problems = append(problems, cacheProblems...)
@@ -637,4 +657,150 @@ func indentErrors(problems []error) string {
 	}
 
 	return strings.Join(lines, "\n")
+}
+
+// validateSession checks the login form and cookie settings.
+//
+// Every check here has the same shape of failure behind it: a session cookie
+// that the browser refuses, or accepts and then sends to somewhere it should
+// not. Both present as "the login does not work" with nothing in the log.
+func (c *Config) validateSession() (problems []error, warnings []string) {
+	s := c.Session
+
+	if !s.Enabled {
+		return nil, nil
+	}
+
+	if !cookieNamePattern.MatchString(s.CookieName) {
+		problems = append(problems, fmt.Errorf(
+			"session.cookie_name %q is not a valid cookie name: use letters, digits, and any of !#$%%&'*+-.^_`|~",
+			s.CookieName))
+	}
+
+	if s.AbsoluteTimeout <= 0 {
+		problems = append(problems, fmt.Errorf("session.absolute_timeout must be positive"))
+	}
+
+	if s.IdleTimeout <= 0 {
+		problems = append(problems, fmt.Errorf("session.idle_timeout must be positive"))
+	}
+
+	if s.AbsoluteTimeout > 0 && s.IdleTimeout > s.AbsoluteTimeout {
+		problems = append(problems, fmt.Errorf(
+			"session.idle_timeout (%s) is longer than session.absolute_timeout (%s), so it can never expire a session",
+			s.IdleTimeout, s.AbsoluteTimeout))
+	}
+
+	if s.RefreshInterval > 0 && s.IdleTimeout > 0 && s.RefreshInterval >= s.IdleTimeout {
+		warnings = append(warnings, fmt.Sprintf(
+			"session.refresh_interval (%s) is not below session.idle_timeout (%s), which would let a session "+
+				"expire in the browser while the service still accepts it; using half the idle window instead",
+			s.RefreshInterval, s.IdleTimeout))
+	}
+
+	if s.AbsoluteTimeout.Duration() > longSessionLifetime {
+		warnings = append(warnings, fmt.Sprintf(
+			"session.absolute_timeout is %s: a signed cookie cannot be revoked before it expires, so a copied "+
+				"one stays valid for that long even after the account is disabled in the directory",
+			s.AbsoluteTimeout))
+	}
+
+	problems = append(problems, c.validateSessionPaths()...)
+
+	sessionProblems, sessionWarnings := c.validateSessionCookieScope()
+	problems = append(problems, sessionProblems...)
+	warnings = append(warnings, sessionWarnings...)
+
+	return problems, warnings
+}
+
+// validateSessionPaths checks the endpoints the browser reaches directly.
+func (c *Config) validateSessionPaths() []error {
+	var problems []error
+
+	s := c.Session
+
+	for _, p := range []struct {
+		key   string
+		value string
+	}{
+		{"session.login_path", s.LoginPath},
+		{"session.logout_path", s.LogoutPath},
+		{"session.cookie_path", s.CookiePath},
+	} {
+		if p.value == "" {
+			problems = append(problems, fmt.Errorf("%s must be set", p.key))
+
+			continue
+		}
+
+		if !strings.HasPrefix(p.value, "/") {
+			problems = append(problems, fmt.Errorf("%s %q must start with a slash", p.key, p.value))
+		}
+
+		if strings.ContainsAny(p.value, " \t\r\n?#") {
+			problems = append(problems, fmt.Errorf(
+				"%s %q must be a plain path, without whitespace, a query or a fragment", p.key, p.value))
+		}
+	}
+
+	for _, p := range []struct {
+		key   string
+		value string
+	}{
+		{"session.login_path", s.LoginPath},
+		{"session.logout_path", s.LogoutPath},
+	} {
+		if slices.Contains(reservedPaths, p.value) {
+			problems = append(problems, fmt.Errorf(
+				"%s %q is one of the service's own endpoints (%s)",
+				p.key, p.value, strings.Join(reservedPaths, ", ")))
+		}
+	}
+
+	if s.LoginPath != "" && s.LoginPath == s.LogoutPath {
+		problems = append(problems, fmt.Errorf(
+			"session.login_path and session.logout_path are both %q; logging out would land on the login form "+
+				"through the same handler and neither would work", s.LoginPath))
+	}
+
+	return problems
+}
+
+// validateSessionCookieScope checks the settings that decide who the cookie is
+// sent to.
+func (c *Config) validateSessionCookieScope() (problems []error, warnings []string) {
+	s := c.Session
+
+	sameSite := strings.ToLower(strings.TrimSpace(s.SameSite))
+
+	switch sameSite {
+	case "", "lax", "strict":
+	case "none":
+		if !s.SecureCookie() {
+			problems = append(problems, fmt.Errorf(
+				"session.same_site is none while session.secure is false: browsers reject that combination, "+
+					"so no session cookie would ever be stored"))
+		}
+
+		warnings = append(warnings, "session.same_site is none: the session cookie is sent with cross-site "+
+			"requests, which is what the login form's CSRF protection exists to prevent")
+	default:
+		problems = append(problems, fmt.Errorf(
+			"session.same_site %q is not one of lax, strict, none", s.SameSite))
+	}
+
+	if !s.SecureCookie() {
+		warnings = append(warnings, "session.secure is false: the session cookie travels over plaintext HTTP, "+
+			"where anyone on the path can copy it and use it until it expires")
+	}
+
+	if s.CookieDomain != "" {
+		warnings = append(warnings, fmt.Sprintf(
+			"session.cookie_domain is %q: the session cookie is sent to every subdomain of it, including ones "+
+				"this service does not protect; leave it empty to bind the cookie to the host that set it",
+			s.CookieDomain))
+	}
+
+	return problems, warnings
 }

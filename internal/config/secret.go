@@ -16,6 +16,15 @@ import (
 // alone. `openssl rand -hex 32` produces 64 characters and passes.
 const minPepperBytes = 32
 
+// minSessionSecretBytes is the minimum accepted length of the session secret.
+//
+// The secret signs the session cookie, which names a user and their groups. A
+// short one is a forgeable session for any account in any group, so it is held
+// to the same length as the cache pepper. It is declared here rather than
+// imported from internal/session to keep this package free of dependencies on
+// the ones it configures.
+const minSessionSecretBytes = 32
+
 // maxSecretBytes bounds how much a secret file may contain. A secret this
 // large is a wrong path — a certificate, a log, a whole configuration file —
 // and reading it into memory silently would hide the mistake.
@@ -43,6 +52,12 @@ func (c *Config) loadSecrets() (warnings []string, err error) {
 		if warning != "" {
 			warnings = append(warnings, "cache.pepper_file: "+warning)
 		}
+	}
+
+	if c.Session.Enabled {
+		secretWarnings, secretProblems := c.loadSessionSecret()
+		warnings = append(warnings, secretWarnings...)
+		problems = append(problems, secretProblems...)
 	}
 
 	if c.Redis.Enabled && c.Redis.PasswordFile != "" {
@@ -147,4 +162,48 @@ func readSecretFile(path string) (secret []byte, warning string, err error) {
 	}
 
 	return secret, warning, nil
+}
+
+// loadSessionSecret reads the cookie signing secret and the optional login
+// template.
+//
+// The template is read here rather than in the server so that a missing file is
+// a startup failure with a path in the message, instead of a 500 the first time
+// somebody tries to log in.
+func (c *Config) loadSessionSecret() (warnings []string, problems []error) {
+	if c.Session.SecretFile == "" {
+		problems = append(problems, fmt.Errorf(
+			"session.secret_file must be set while session.enabled is true; generate it with: "+
+				"openssl rand -hex 32 > /etc/nginx-ldap-auth/session.secret"))
+	} else {
+		secret, warning, err := readSecretFile(c.Session.SecretFile)
+
+		switch {
+		case err != nil:
+			problems = append(problems, fmt.Errorf("session.secret_file: %w", err))
+		case len(secret) < minSessionSecretBytes:
+			problems = append(problems, fmt.Errorf(
+				"session.secret_file: %s holds %d bytes, at least %d are required; "+
+					"generate it with: openssl rand -hex 32",
+				c.Session.SecretFile, len(secret), minSessionSecretBytes))
+		default:
+			c.Session.Secret = secret
+		}
+
+		if warning != "" {
+			warnings = append(warnings, "session.secret_file: "+warning)
+		}
+	}
+
+	if c.Session.LoginTemplate != "" {
+		// The path comes from the configuration file, which is trusted.
+		source, err := os.ReadFile(c.Session.LoginTemplate) //nolint:gosec // template paths are configuration, not request input
+		if err != nil {
+			problems = append(problems, fmt.Errorf("session.login_template: %w", err))
+		} else {
+			c.Session.LoginTemplateSource = source
+		}
+	}
+
+	return warnings, problems
 }

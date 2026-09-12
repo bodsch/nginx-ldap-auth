@@ -185,6 +185,7 @@ install-files: ## Install an already-built tree (honours DESTDIR and PREFIX).
 	install -Dm0644 packaging/$(BINARY).tmpfiles $(DESTDIR)$(TMPFILESDIR)/$(BINARY).conf
 	install -Dm0640 config.example.yaml $(DESTDIR)$(SYSCONFDIR)/$(BINARY)/config.yaml
 	install -Dm0644 nginx/auth.conf $(DESTDIR)$(DOCDIR)/examples/auth.conf
+	install -Dm0644 nginx/auth-session.conf $(DESTDIR)$(DOCDIR)/examples/auth-session.conf
 	install -Dm0644 config.example.yaml $(DESTDIR)$(DOCDIR)/config.example.yaml
 	install -Dm0644 README.md $(DESTDIR)$(DOCDIR)/README.md
 	install -Dm0644 project.md $(DESTDIR)$(DOCDIR)/project.md

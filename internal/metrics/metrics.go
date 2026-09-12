@@ -96,7 +96,7 @@ var (
 
 	knownBackends = closedSet(cacheBackendMemory, cacheBackendRedis, cacheBackendDisabled)
 
-	knownHandlers = closedSet("auth", "healthz", "readyz")
+	knownHandlers = closedSet("auth", "healthz", "readyz", "login", "logout")
 )
 
 // closedSet builds a lookup from the values a label may take.
@@ -133,6 +133,25 @@ var knownReasons = map[string]struct{}{
 	"throttled_capacity":    {},
 	"directory_error":       {},
 	"directory_missing":     {},
+
+	// Session outcomes. They are separate values rather than one
+	// "no_session" bucket because the difference between a session that ran
+	// out and one that failed to verify is the difference between a timeout
+	// that is set too short and somebody forging cookies.
+	"session":                  {},
+	"session_refreshed":        {},
+	"session_established":      {},
+	"session_ended":            {},
+	"no_session":               {},
+	"session_expired_absolute": {},
+	"session_expired_idle":     {},
+	"session_policy_mismatch":  {},
+	"session_forged":           {},
+	"session_malformed":        {},
+	"session_invalid":          {},
+	"session_not_issued":       {},
+	"basic_not_allowed":        {},
+	"csrf_failed":              {},
 }
 
 // Options configures the metric set.

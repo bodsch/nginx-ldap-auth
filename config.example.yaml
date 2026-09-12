@@ -115,6 +115,81 @@ ldap:
       # already TLS from the first byte.
       # start_tls: false
 
+# Login form and signed session cookie.
+#
+# Without this the service uses HTTP Basic Authentication alone, which has no
+# logout and no expiry: the browser keeps replaying the credentials until it is
+# closed, so a login survives days of inactivity.
+#
+# With it, a successful login sets a signed cookie that expires on its own, and
+# /logout ends it. The cookie carries the decision, never the password.
+#
+# Enabling this needs three things: a secret file, the two extra locations in
+# the nginx configuration (see examples/auth-session.conf), and a restart.
+session:
+  enabled: false
+
+  # Signs the cookie. Required while sessions are enabled — an unsigned cookie
+  # is a request parameter, and a visitor could name any user in any group.
+  # Generate once, per installation, and keep it out of travelling backups:
+  #   openssl rand -hex 32 > /etc/nginx-ldap-auth/session.secret
+  #   chmod 0640 /etc/nginx-ldap-auth/session.secret
+  #
+  # Replacing it ends every session immediately, which is the closest thing to
+  # a "log everybody out" button this service has.
+  secret_file: /etc/nginx-ldap-auth/session.secret
+
+  # Maximum lifetime, counted from the login and never extended. A session in
+  # constant use still ends here.
+  #
+  # This is the only bound on a cookie that has been copied: there is no
+  # server-side session table to delete it from, so it stays usable until this
+  # expires, even after the account is disabled in the directory.
+  absolute_timeout: 8h
+
+  # How long a session survives without being used.
+  idle_timeout: 30m
+
+  # How old the cookie's last-seen stamp has to be before it is re-issued.
+  # nginx makes one authentication subrequest per HTTP request, so refreshing
+  # on every one of them would put a Set-Cookie on every image on every page.
+  refresh_interval: 5m
+
+  # Two services on the same domain need two different names, or each will
+  # overwrite the other's session.
+  cookie_name: nginx_ldap_auth
+  cookie_path: /
+
+  # Leave empty to bind the cookie to the exact host that set it. Any value at
+  # all also sends it to every subdomain, including ones this service does not
+  # protect.
+  # cookie_domain: ""
+
+  # Keeps the cookie off plaintext HTTP. Only turn this off for a local test
+  # setup without TLS — on a real deployment it lets anyone on the path copy
+  # the session.
+  secure: true
+
+  # lax, strict or none. Lax is what lets a link from another site land on a
+  # page the user is already signed in to.
+  same_site: lax
+
+  # Served by this service, proxied by nginx. Unlike /auth these are reached by
+  # the browser directly.
+  login_path: /login
+  logout_path: /logout
+
+  # Replaces the built-in form. An html/template, parsed at startup, rendered
+  # with .Realm .Policy .Action .Next .CSRFToken .Username .Error
+  # login_template: /etc/nginx-ldap-auth/login.html
+
+  # Keeps HTTP Basic Authentication working for curl, monitoring checks and API
+  # clients. Browsers are never challenged with it while sessions are enabled:
+  # a WWW-Authenticate header would make the browser open its own password
+  # dialog instead of following the redirect to the login form, and the
+  # credentials it caches there would be back to never expiring.
+  allow_basic: true
+
 cache:
   # nginx issues one authentication request per HTTP request, including every
   # static asset. Without the cache a single page view becomes dozens of LDAP

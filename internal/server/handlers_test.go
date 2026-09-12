@@ -66,8 +66,18 @@ func (s stubDirectory) Authenticate(_ context.Context, user, password string) (*
 		return nil, fmt.Errorf("%w: empty password reached the directory", ldap.ErrInvalidCredentials)
 	}
 
-	if user != s.user || password != s.password {
-		return nil, fmt.Errorf("%w: stub directory", ldap.ErrInvalidCredentials)
+	// Two different messages, both wrapping ErrInvalidCredentials, because
+	// that is what internal/ldap produces: "no entry matched" for a user
+	// that does not exist and "directory rejected the password" for one
+	// that does. A fake that returns one string for both cannot catch a
+	// handler that puts the error text on the page — and putting it there
+	// is the obvious "more helpful error message" refactor.
+	if user != s.user {
+		return nil, fmt.Errorf("%w: no entry matched", ldap.ErrInvalidCredentials)
+	}
+
+	if password != s.password {
+		return nil, fmt.Errorf("%w: directory rejected the password", ldap.ErrInvalidCredentials)
 	}
 
 	return s.identity, nil
@@ -115,6 +125,19 @@ type testOptions struct {
 
 	// observer, when set, receives the decision and HTTP reports.
 	observer Observer
+
+	// sessionCfg, when set, enables the login form and the session cookie.
+	// A nil one is the Basic-Authentication-only service, which is what
+	// every test written before sessions existed still exercises.
+	sessionCfg *config.Session
+
+	// alsoPolicy adds a second policy that admits any authenticated user.
+	//
+	// It exists so that "a session is bound to its policy" can be tested
+	// against a policy that *would* have let the user in, rather than
+	// against a name that resolves to nothing — which proves only that
+	// unknown policies are refused, a different property entirely.
+	alsoPolicy string
 }
 
 func newTestServer(t *testing.T, opts testOptions) *testServer {
@@ -123,17 +146,28 @@ func newTestServer(t *testing.T, opts testOptions) *testServer {
 	requireGroups := opts.requireGrp
 	allowAny := len(requireGroups) == 0
 
+	configured := map[string]*config.Policy{
+		"intranet": {
+			Name:          "intranet",
+			Realm:         `Intranet "HQ"`,
+			LDAP:          "primary",
+			RequireGroups: requireGroups,
+			AllowAnyUser:  allowAny,
+		},
+	}
+
+	if opts.alsoPolicy != "" {
+		configured[opts.alsoPolicy] = &config.Policy{
+			Name:         opts.alsoPolicy,
+			Realm:        opts.alsoPolicy,
+			LDAP:         "primary",
+			AllowAnyUser: true,
+		}
+	}
+
 	policies, err := policy.NewSet(&config.Config{
 		DefaultPolicy: "intranet",
-		Policies: map[string]*config.Policy{
-			"intranet": {
-				Name:          "intranet",
-				Realm:         `Intranet "HQ"`,
-				LDAP:          "primary",
-				RequireGroups: requireGroups,
-				AllowAnyUser:  allowAny,
-			},
-		},
+		Policies:      configured,
 	})
 	if err != nil {
 		t.Fatalf("policy.NewSet: %v", err)
@@ -189,6 +223,15 @@ func newTestServer(t *testing.T, opts testOptions) *testServer {
 		clientIP = "X-Real-IP"
 	}
 
+	var sessions *Sessions
+
+	if opts.sessionCfg != nil {
+		sessions, err = NewSessions(*opts.sessionCfg)
+		if err != nil {
+			t.Fatalf("NewSessions: %v", err)
+		}
+	}
+
 	srv, err := New(Options{
 		Config: config.Server{
 			Listen:          "127.0.0.1:0",
@@ -200,6 +243,7 @@ func newTestServer(t *testing.T, opts testOptions) *testServer {
 			MaxHeaderBytes:  8192,
 		},
 		Authenticator: authenticator,
+		Sessions:      sessions,
 		Cache:         decisionCache,
 		Throttle:      throttle,
 		LogUsername:   opts.logUsername,

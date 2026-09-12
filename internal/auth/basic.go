@@ -81,7 +81,23 @@ func ParseBasic(header string) (user, password string, err error) {
 		return "", "", fmt.Errorf("%w: decoded credentials contain no colon", ErrMalformedCredentials)
 	}
 
+	return ValidateCredentials(user, password)
+}
+
+// ValidateCredentials applies the rules a login name and password have to
+// satisfy before either reaches the directory.
+//
+// It is split out of ParseBasic because the login form arrives with the two
+// values already separated. Re-encoding them into a Basic header just to parse
+// them back would put the rules for what a username may contain in one place
+// and the form in another, and the day they disagree is the day the form
+// becomes the way around them.
+func ValidateCredentials(user, password string) (string, string, error) {
 	if user == "" {
+		if password == "" {
+			return "", "", ErrNoCredentials
+		}
+
 		return "", "", fmt.Errorf("%w: username is empty", ErrMalformedCredentials)
 	}
 

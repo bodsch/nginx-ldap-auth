@@ -25,6 +25,7 @@ type Config struct {
 	DefaultPolicy string             `yaml:"default_policy"`
 	Policies      map[string]*Policy `yaml:"policies"`
 	LDAP          map[string]*LDAP   `yaml:"ldap"`
+	Session       Session            `yaml:"session"`
 	Cache         Cache              `yaml:"cache"`
 	Redis         Redis              `yaml:"redis"`
 	RateLimit     RateLimit          `yaml:"rate_limit"`
@@ -155,6 +156,91 @@ type LDAP struct {
 	BindPassword string `yaml:"-"`
 }
 
+// Session configures the login form and the signed session cookie.
+//
+// It is what gives the service an expiring login. Basic Authentication has
+// neither a logout nor an expiry — the browser replays the credentials until it
+// is closed — so without this section a login lasts as long as the browser
+// window does, which in practice is days.
+//
+// Disabled by default, because enabling it changes how every protected location
+// behaves and requires a secret file and an nginx change to go with it.
+type Session struct {
+	Enabled bool `yaml:"enabled"`
+
+	// CookieName is the cookie the session travels in. Two services on the
+	// same domain need two different names, or each will overwrite the
+	// other's session.
+	CookieName string `yaml:"cookie_name"`
+
+	// SecretFile keys the HMAC that signs the cookie. Required while
+	// sessions are enabled: an unsigned cookie is a request parameter, and
+	// a visitor would be able to name any user in any group.
+	SecretFile string `yaml:"secret_file"`
+
+	// AbsoluteTimeout is the maximum lifetime of a session, counted from
+	// the login and never extended.
+	//
+	// It is the only bound on a stateless cookie: there is no server-side
+	// session table to delete from, so a cookie that has been copied stays
+	// usable until this expires. Eight hours is a working day.
+	AbsoluteTimeout Duration `yaml:"absolute_timeout"`
+
+	// IdleTimeout is how long a session survives without being used.
+	IdleTimeout Duration `yaml:"idle_timeout"`
+
+	// RefreshInterval is how old the cookie's last-seen stamp has to be
+	// before it is re-issued.
+	//
+	// nginx makes one authentication subrequest per HTTP request, so
+	// refreshing on every one of them would put a Set-Cookie on every image
+	// on every page. Zero, or anything not below the idle timeout, falls
+	// back to half the idle window.
+	RefreshInterval Duration `yaml:"refresh_interval"`
+
+	CookiePath   string `yaml:"cookie_path"`
+	CookieDomain string `yaml:"cookie_domain"`
+
+	// Secure is a pointer for the same reason as TLS.Verify: an omitted key
+	// has to mean "on", and the bool zero value would silently mean the
+	// opposite. A cookie without it travels over plaintext HTTP.
+	Secure *bool `yaml:"secure"`
+
+	// SameSite is one of lax, strict, none.
+	SameSite string `yaml:"same_site"`
+
+	// LoginPath and LogoutPath are served by this service and proxied by
+	// nginx. Unlike /auth they are reached by the browser directly, not
+	// through auth_request.
+	LoginPath  string `yaml:"login_path"`
+	LogoutPath string `yaml:"logout_path"`
+
+	// LoginTemplate replaces the built-in form. It is an html/template
+	// parsed once at startup, so a syntax error is a startup failure rather
+	// than a 500 on the first login.
+	LoginTemplate string `yaml:"login_template"`
+
+	// AllowBasic keeps HTTP Basic Authentication working alongside the
+	// session, for curl, monitoring checks and API clients. The browser is
+	// never challenged with it while sessions are enabled — a WWW-
+	// Authenticate header would make the browser open its own password
+	// dialog instead of following the redirect to the login form, and the
+	// credentials it cached there would be back to never expiring.
+	AllowBasic bool `yaml:"allow_basic"`
+
+	// Secret is loaded from SecretFile.
+	Secret []byte `yaml:"-"`
+
+	// LoginTemplateSource is the parsed content of LoginTemplate.
+	LoginTemplateSource []byte `yaml:"-"`
+}
+
+// SecureCookie reports whether the session cookie is restricted to HTTPS. An
+// unset value means yes.
+func (s Session) SecureCookie() bool {
+	return s.Secure == nil || *s.Secure
+}
+
 // Cache configures the in-process decision cache.
 type Cache struct {
 	Enabled     bool     `yaml:"enabled"`
@@ -230,6 +316,18 @@ func Defaults() *Config {
 			IdleTimeout:     Duration(30 * time.Second),
 			ShutdownTimeout: Duration(10 * time.Second),
 			MaxHeaderBytes:  8192,
+		},
+		Session: Session{
+			Enabled:         false,
+			CookieName:      "nginx_ldap_auth",
+			AbsoluteTimeout: Duration(8 * time.Hour),
+			IdleTimeout:     Duration(30 * time.Minute),
+			RefreshInterval: Duration(5 * time.Minute),
+			CookiePath:      "/",
+			SameSite:        "lax",
+			LoginPath:       "/login",
+			LogoutPath:      "/logout",
+			AllowBasic:      true,
 		},
 		Cache: Cache{
 			Enabled:     true,

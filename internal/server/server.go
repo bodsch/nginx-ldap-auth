@@ -39,6 +39,11 @@ type Server struct {
 	throttle ratelimit.Throttle
 	observer Observer
 
+	// sessions is nil when the login form and the session cookie are
+	// disabled, which leaves the service exactly as it was: Basic
+	// Authentication, and a login that lasts as long as the browser does.
+	sessions *Sessions
+
 	// logUsername mirrors logging.log_username.
 	logUsername bool
 
@@ -66,6 +71,10 @@ type Options struct {
 	LogUsername   bool
 	Logger        *slog.Logger
 
+	// Sessions is optional. A nil one disables the login form, the logout
+	// endpoint and the session cookie.
+	Sessions *Sessions
+
 	// Observer is optional. A nil one is replaced with a no-op, so the
 	// request path never branches on whether metrics are enabled.
 	Observer Observer
@@ -92,6 +101,7 @@ func New(opts Options) (*Server, error) {
 		cache:       opts.Cache,
 		throttle:    opts.Throttle,
 		observer:    observer,
+		sessions:    opts.Sessions,
 		logUsername: opts.LogUsername,
 		startedAt:   time.Now(),
 	}
@@ -121,6 +131,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc(PathAuth, s.observed("auth", s.handleAuth))
 	mux.HandleFunc(PathHealth, s.observed("healthz", s.handleHealth))
 	mux.HandleFunc(PathReady, s.observed("readyz", s.handleReady))
+
+	if s.sessions != nil {
+		mux.HandleFunc(s.sessions.loginPath, s.observed("login", s.handleLogin))
+		mux.HandleFunc(s.sessions.logoutPath, s.observed("logout", s.handleLogout))
+	}
 
 	return mux
 }

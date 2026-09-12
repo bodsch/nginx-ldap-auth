@@ -181,9 +181,18 @@ func serve(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		return fmt.Errorf("prepare authenticator: %w", err)
 	}
 
+	// Built before the server, because a broken login template or an
+	// unusable secret has to stop the process here rather than surface as a
+	// failed login later.
+	sessions, err := server.NewSessions(cfg.Session)
+	if err != nil {
+		return fmt.Errorf("prepare sessions: %w", err)
+	}
+
 	srv, err := server.New(server.Options{
 		Config:        cfg.Server,
 		Authenticator: authenticator,
+		Sessions:      sessions,
 		Cache:         decisionCache,
 		Throttle:      throttle,
 		LogUsername:   cfg.Logging.LogUsername,
@@ -391,7 +400,24 @@ func logStartup(log *slog.Logger, cfg *config.Config, policies *policy.Set, deci
 		slog.String("cache_ttl", cfg.Cache.TTL.String()),
 		slog.String("negative_ttl", cfg.Cache.NegativeTTL.String()),
 		slog.Bool("throttle", cfg.RateLimit.Enabled),
+		slog.Bool("session", cfg.Session.Enabled),
 	)
+
+	// The two timeouts are the answer to "why am I still logged in", so they
+	// belong in the journal rather than only in the configuration file.
+	if cfg.Session.Enabled {
+		log.Info("sessions enabled",
+			slog.String("login_path", cfg.Session.LoginPath),
+			slog.String("logout_path", cfg.Session.LogoutPath),
+			slog.String("absolute_timeout", cfg.Session.AbsoluteTimeout.String()),
+			slog.String("idle_timeout", cfg.Session.IdleTimeout.String()),
+			slog.Bool("basic_auth_accepted", cfg.Session.AllowBasic),
+			slog.Bool("secure_cookie", cfg.Session.SecureCookie()),
+		)
+	} else {
+		log.Info("sessions disabled: HTTP Basic Authentication has no logout and no expiry, " +
+			"so a browser stays signed in until it is closed")
+	}
 
 	// Without a default policy, every protected location has to set the
 	// header. That is the safer arrangement and also the one most likely to

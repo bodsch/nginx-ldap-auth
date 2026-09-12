@@ -153,9 +153,9 @@ This limits all traffic to the location, not just failed authentications, so the
 
 ## 4. Authentication flow
 
-The initial implementation uses HTTP Basic Authentication.
+The service accepts credentials in two forms: HTTP Basic Authentication, and a login form that issues a signed session cookie (section 4a). Both reach the same decision path — the same policy resolution, throttle, cache and directory — because a second path is a second set of rules to keep in step, and the one that drifts is always the one nobody is looking at.
 
-Basic Authentication has no logout: the browser keeps sending the credentials until it is closed. This is accepted for the initial milestone — the alternative, a login form plus a signed session cookie as used by the original nginx reference daemon, is deliberately out of scope (section 19). It must be stated in the README so operators are not surprised by it.
+Basic Authentication alone has no logout and no expiry: the browser keeps sending the credentials until it is closed, which in practice means for days. That was accepted for the first milestone and is no longer the default answer; it remains the right one for clients that cannot hold a cookie.
 
 ```text
 Browser
@@ -198,6 +198,70 @@ The service must never store plaintext passwords.
 Cache entries must not permit password recovery; the key derivation is specified in section 6.
 
 Cache entries must have a short configurable TTL.
+
+## 4a. Sessions
+
+Basic Authentication cannot expire, and that is not a detail an operator can work around: there is no logout, closing a tab does nothing, and the browser replays the credentials for as long as it is open. Section 19 listed a login form with a signed session cookie as a future extension; it is now implemented, and this section is what it has to do.
+
+Sessions are off by default. Enabling them changes how every protected location behaves and needs a secret file and an nginx change to go with it, so it must be a decision rather than something that happens on upgrade.
+
+### The cookie
+
+The session is stateless: the cookie carries the decision and its own signature, and there is no server-side session table. That is what makes it work across instances and across restarts without Redis, and it is also its one weakness — see "revocation" below.
+
+```text
+value  = "1." + base64url(payload) + "." + base64url(HMAC-SHA256(secret, "1." + base64url(payload)))
+payload = { "u": user, "p": policy, "g": [groups], "i": issued_at, "s": last_seen }
+```
+
+Requirements:
+
+- The signature is verified before the payload is parsed, so malformed JSON from an unsigned value never reaches the decoder, and it is compared in constant time.
+- The format carries a version, and the version is part of the signed input. An unknown version is rejected rather than guessed at: a parser that tries formats until one verifies is a parser that can be downgraded.
+- The payload holds no password. Everything in it was already sent to the upstream application in a response header.
+- The signing secret is a file, at least 32 bytes, held to the same standard as the cache pepper. Without one the cookie is a request parameter and a visitor can name any user in any group.
+- The cookie is `HttpOnly` and `SameSite=Lax`, and `Secure` unless the operator explicitly turns it off for a test setup — which validation warns about.
+- A cookie is valid only for the policy it was issued for. One instance serves several applications, and a session for the intranet must not open the monitoring UI.
+
+### The two timeouts
+
+| | Runs from | Extended by use | Default |
+|---|---|---|---|
+| absolute | the login | never | 8h |
+| idle | the last request | yes | 30m |
+
+The absolute timeout is the only bound on a cookie that has been copied, which is why it must not be extendable by using the session — a browser left open on a dashboard would otherwise never log out.
+
+The idle window slides, but not on every request: nginx makes one auth subrequest per HTTP request, so re-issuing the cookie every time would put a `Set-Cookie` on every asset. The cookie is re-issued once its last-seen stamp is older than `refresh_interval`, which must stay below the idle timeout — a longer one would let a session expire in the browser while the service still accepts it, and configuration validation clamps it to half the idle window rather than allowing that.
+
+### Revocation
+
+A stateless cookie cannot be withdrawn before it expires. This is the deliberate trade-off against a session store, and it has to be stated rather than discovered:
+
+- Disabling an account in the directory stops new logins at once and the existing session at its next expiry, up to the absolute timeout later.
+- Replacing the signing secret and restarting invalidates every session at once. That is the only "log everybody out" this design has.
+- `/logout` clears the cookie in one browser.
+
+An operator for whom the first point is unacceptable shortens the absolute timeout; the alternative — a server-side session store — is a section 19 item.
+
+### The login form
+
+`/login` and `/logout` are served by this service and proxied by nginx as ordinary locations. Unlike `/auth` they are reached by the browser directly.
+
+- The form posts `username`, `password`, `csrf_token` and `next`. It is protected by a signed double-submit token in a `SameSite=Strict` cookie: a cross-site POST does not carry that cookie, so the check fails before the values are compared. Without it, an attacker cannot read the response but can make a visitor's browser submit *the attacker's* credentials, and everything the visitor then does happens in the attacker's session.
+- `next` is client-controlled and must be reduced to a same-site path. An absolute URL, a scheme-relative `//host`, a backslash form, or anything with a control character in it falls back to `/`. A login page that follows it unchanged is an open redirect on the one page that takes a password.
+- Failure messages must not distinguish "no such user" from "wrong password". A form that does is a form that confirms which accounts exist.
+- A CSRF failure is not an authentication failure: the credentials were never evaluated, so it must not count against the throttle.
+- The page must be self-contained — no external stylesheet, script, font or image. A login page that depends on an asset from elsewhere is a login page that fails while the site behind it is up.
+- The built-in form may be replaced by a template, parsed at startup so that a broken one is a service that does not start rather than a 500 at the first login.
+
+### Interaction with Basic Authentication
+
+While sessions are enabled the `401` must not carry `WWW-Authenticate`. The browser would open its own password dialog instead of following nginx's redirect to the form, and the credentials it caches there never expire — which is the problem this whole section exists to remove.
+
+Basic Authentication is still accepted from a client that sends it unprompted, which is every client that cannot hold a cookie: curl, monitoring checks, API consumers. It can be turned off with `allow_basic: false`.
+
+The `401` carries the address of the login form in a response header, so that nginx can redirect to it without the path being configured in two places.
 
 ## 5. LDAP
 
@@ -502,6 +566,16 @@ nginx forwards only `2xx`, `401` and `403`; `429` and `5xx` both reach the brows
 
 The endpoint must not be directly exposed to untrusted clients. Binding to `127.0.0.1` is the default; a Unix domain socket would be stronger and is a section 19 item.
 
+### `GET /login`, `POST /login`, `GET /logout`
+
+Present only while `session.enabled` is set. Reached by the browser through an ordinary nginx location, not through `auth_request`.
+
+`GET /login` renders the form and sets the CSRF token cookie. A visitor who already holds a valid session is redirected to `next` instead of being offered a form that would start a second one.
+
+`POST /login` verifies the token, evaluates the credentials through the normal decision path, and on success sets the session cookie and answers `303` to `next`. A failure re-renders the form with the status the decision produced — `401`, `403`, `429` or `502` — so that the outcome is visible to a monitoring system as well as to the user.
+
+`GET /logout` clears the session and the token cookie and redirects to the form. `GET` is accepted alongside `POST`: the worst a forged logout can do is end a session the user can start again, where refusing `GET` would mean every application embedding a logout link has to grow a form.
+
 ### `GET /healthz`
 
 Liveness endpoint.
@@ -703,6 +777,12 @@ Security is a primary design requirement.
 - Apply strict network and HTTP timeouts.
 - Limit request body/header sizes where applicable.
 - Reject malformed Basic Authentication headers.
+- Verify a session cookie's signature before parsing its payload, in constant time, and reject an unknown format version rather than guessing at it.
+- Keep the session signing secret out of the main configuration file and out of all logs, hold it to at least 32 bytes, and never let a session cookie carry a password.
+- Bind a session cookie to the policy it was issued for.
+- Never send `WWW-Authenticate` while the login form is enabled: the browser's own dialog caches credentials that cannot expire, which is what the session exists to prevent.
+- Reduce the login form's redirect target to a same-site path. It is client-supplied, and following it unchanged is an open redirect on the page that takes a password.
+- Protect the login form against cross-site submission, and do not count a failed CSRF check against the throttle — the credentials were never evaluated.
 - Never compare a secret locally. This replaces an earlier requirement to "use constant-time comparisons where applicable", which was wrong to state: nothing in the service compares a secret, so there was nothing for it to apply to and no way to verify it. A password is emptiness-checked, fed to an HMAC, and sent to the directory — never matched against a stored value. The property to preserve is the absence of such a comparison, not a timing-safe way to perform one; adding a local password check would be the change that makes constant-time comparison necessary, and it should not be made.
 - A decision nobody set must deny. The zero value of the cached decision is "invalid credentials", so a struct produced by a failed deserialisation, a partial write, or a field added later refuses access rather than granting it.
 - A cache that returns an error is a cache miss, whatever else it reports. A backend may return a hit and an error together; the error alone disqualifies the entry.
@@ -1002,7 +1082,7 @@ Potential future features:
 - configuration reload without restart
 - administrative cache invalidation
 - throttle state shared across instances
-- login form with a signed session cookie, to get a real logout
+- a server-side session store, for sessions that can be revoked before they expire (section 4a)
 - audit logging
 - optional client certificate authentication
 - OIDC support only if there is a compelling requirement
@@ -1047,6 +1127,15 @@ The goal is a small authentication component that fills the gap between nginx an
 2. ~~Redis cache backend~~
 3. ~~Integration tests against a GLAuth binary~~
 4. ~~Arch Linux PKGBUILD~~
+
+### Milestone 3 — a login that expires
+
+1. ~~Signed session cookie with an absolute and an idle timeout (section 4a)~~
+2. ~~Login form with CSRF protection, and `/logout`~~
+3. ~~`session` configuration section, validation, and the secret file~~
+4. ~~nginx example that redirects to the form and carries the sliding cookie back~~
+
+This was a section 19 item, brought forward because the alternative it was compared against — Basic Authentication with no logout — turned out to be the first thing an operator notices in production: a login that survives days of inactivity.
 
 Metrics, Redis and the integration suite were moved out of the first milestone deliberately. None of them changes whether the service authenticates correctly, and the original seventeen-point milestone was not the "intentionally small" first step it claimed to be.
 

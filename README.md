@@ -16,9 +16,10 @@ question: may this request through?
 
 Milestone 1 complete. Milestone 2 complete except the Arch Linux PKGBUILD.
 
-Working and covered by tests: authentication, authorization, the in-process and
-the shared Redis cache, throttling, Prometheus metrics, and an integration suite
-against a real GLAuth directory. See [project.md](project.md) §21.
+Working and covered by tests: authentication, authorization, the login form and
+the signed session cookie, the in-process and the shared Redis cache,
+throttling, Prometheus metrics, and an integration suite against a real GLAuth
+directory. See [project.md](project.md) §21.
 
 ## Install
 
@@ -122,7 +123,8 @@ Three things about this are load-bearing:
   matches no policy is always refused — never silently replaced with the
   default.
 - **Basic Authentication needs HTTPS.** The password travels on every single
-  request.
+  request. It also has no logout and no expiry — see
+  [Sessions](#sessions-a-login-that-expires) for the login form that does.
 
 ### What nginx does with the answer
 
@@ -134,10 +136,95 @@ where it is useful.
 | Service answers | Meaning | Browser sees |
 |---|---|---|
 | `200` | authenticated and authorized | the application |
-| `401` | missing, malformed or wrong credentials, or an empty password | a password prompt |
+| `401` | missing, malformed or wrong credentials, an empty password, or an expired session | a password prompt, or the login form when sessions are enabled |
 | `403` | valid credentials, group requirement not met — or an unknown policy | `403` |
 | `429` | too many failures for this username or address | `500` |
 | `502` | the directory could not be reached | `500` |
+
+## Sessions: a login that expires
+
+HTTP Basic Authentication has no logout and no expiry. The browser stores the
+credentials and replays them on every request until it is closed, so a login
+survives days of inactivity — closing the tab does nothing, and there is no
+"sign out" that works.
+
+Setting `session.enabled: true` replaces that with a login form and a signed
+cookie:
+
+```yaml
+session:
+  enabled: true
+  secret_file: /etc/nginx-ldap-auth/session.secret
+  absolute_timeout: 8h    # maximum lifetime, counted from the login
+  idle_timeout: 30m       # ends a session that is not being used
+```
+
+Then use [`nginx/auth-session.conf`](nginx/auth-session.conf) instead of
+`auth.conf`. It adds two ordinary locations for `/login` and `/logout`, turns
+the `401` into a redirect to the form, and — the line that is easy to miss —
+copies `Set-Cookie` out of the auth subrequest:
+
+```nginx
+auth_request_set $auth_cookie $upstream_http_set_cookie;
+add_header Set-Cookie $auth_cookie;
+```
+
+Without those two lines everything still works, except that the idle window
+stops sliding: everyone is logged out at the absolute timeout regardless of how
+busy they were.
+
+### What the two timeouts do
+
+| | Runs from | Extended by use | Ends |
+|---|---|---|---|
+| `absolute_timeout` | the login | no | a working day later, whatever the user is doing |
+| `idle_timeout` | the last request | yes | after a lunch break away from the keyboard |
+
+The cookie is re-issued once its last-seen stamp is older than
+`refresh_interval` (5 minutes by default) rather than on every request — nginx
+makes one auth subrequest per HTTP request, so refreshing every time would put a
+`Set-Cookie` on every image on every page.
+
+### What is in the cookie, and what is not
+
+The cookie carries the decision — username, policy, group names, the two
+timestamps — signed with HMAC-SHA256 over `session.secret_file`. The password is
+not in it, and neither is anything the upstream application was not already sent
+in a response header. It is `HttpOnly`, `Secure` and `SameSite=Lax`, and the
+login form is protected against cross-site submission by a `SameSite=Strict`
+double-submit token.
+
+There is no server-side session table, which is what makes this work across
+instances and across restarts without Redis. The cost is that a session cannot
+be revoked before it expires:
+
+- **Disabling an account in the directory** stops new logins immediately, and
+  stops the existing session at the next expiry — up to `absolute_timeout`
+  later. Shorten it if that window matters.
+- **Replacing `session.secret_file` and restarting** invalidates every session
+  at once. That is the closest thing to a "log everybody out" button.
+- **`/logout`** clears the cookie in that one browser.
+
+### Clients that cannot hold a cookie
+
+`allow_basic: true` (the default) keeps HTTP Basic Authentication working for
+curl, monitoring checks and API clients. Browsers are never challenged with it
+while sessions are enabled: a `WWW-Authenticate` header would make the browser
+open its own password dialog instead of following the redirect to the form —
+and the credentials it caches there would be back to never expiring.
+
+```bash
+# Still works with sessions enabled.
+curl -u alice https://intranet.example.org/api/report
+```
+
+### Replacing the form
+
+`session.login_template` points at an `html/template` parsed at startup, so a
+syntax error stops the service rather than surfacing as a 500 at the first
+login. It is rendered with `.Realm`, `.Policy`, `.Action`, `.Next`,
+`.CSRFToken`, `.Username` and `.Error`; the form has to post `username`,
+`password`, `csrf_token` and `next` back to `.Action`.
 
 ## Policies
 
@@ -253,6 +340,8 @@ On the authentication listener (`server.listen`, loopback):
 | Path | Purpose |
 |---|---|
 | `/auth` | the decision, called by nginx. Not for clients. |
+| `/login` | the login form, when `session.enabled` is set. Proxied by nginx and reached by the browser directly. |
+| `/logout` | ends the session and returns to the form. Only present when `session.enabled` is set. |
 | `/healthz` | liveness. Deliberately independent of LDAP: a failing probe means a restart, and a restart discards the cache that was absorbing the outage. |
 | `/readyz` | readiness, plus cache and throttle counters as JSON. |
 

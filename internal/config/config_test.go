@@ -590,3 +590,223 @@ cache:
 		}
 	})
 }
+
+func TestSessionValidation(t *testing.T) {
+	secret := writeFile(t, "session.secret", strings.Repeat("s", 64), 0o600)
+
+	withSession := func(session string) string {
+		return `
+policies:
+  intranet:
+    ldap: primary
+    allow_any_user: true
+ldap:
+  primary:
+    url: ldaps://dir.example.org:636
+    base_dn: dc=example,dc=org
+cache:
+  enabled: false
+` + session
+	}
+
+	t.Run("enabled and valid", func(t *testing.T) {
+		cfg, _, err := loadYAML(t, withSession(
+			"session:\n  enabled: true\n  secret_file: "+secret+"\n"))
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+
+		if !cfg.Session.Enabled {
+			t.Fatal("session.enabled was not read")
+		}
+
+		// The two timeouts the feature exists for, and the settings that
+		// decide who the cookie reaches, all have to default without
+		// being written down.
+		switch {
+		case cfg.Session.AbsoluteTimeout.Duration() != 8*time.Hour:
+			t.Errorf("absolute_timeout = %s, want 8h", cfg.Session.AbsoluteTimeout)
+		case cfg.Session.IdleTimeout.Duration() != 30*time.Minute:
+			t.Errorf("idle_timeout = %s, want 30m", cfg.Session.IdleTimeout)
+		case cfg.Session.CookieName != "nginx_ldap_auth":
+			t.Errorf("cookie_name = %q, want nginx_ldap_auth", cfg.Session.CookieName)
+		case !cfg.Session.SecureCookie():
+			t.Error("secure defaulted to false; the cookie would travel over plaintext HTTP")
+		case !cfg.Session.AllowBasic:
+			t.Error("allow_basic defaulted to false; every curl client would break on upgrade")
+		case string(cfg.Session.Secret) != strings.Repeat("s", 64):
+			t.Error("the signing secret was not loaded")
+		}
+	})
+
+	// Sessions are off unless asked for. Enabling them changes how every
+	// protected location behaves, so it must not happen on an upgrade.
+	t.Run("disabled by default", func(t *testing.T) {
+		cfg, _, err := loadYAML(t, withSession(""))
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+
+		if cfg.Session.Enabled {
+			t.Error("session.enabled defaulted to true")
+		}
+	})
+
+	// An unsigned cookie is a request parameter: a visitor could name any
+	// user in any group.
+	t.Run("no secret file", func(t *testing.T) {
+		_, _, err := loadYAML(t, withSession("session:\n  enabled: true\n"))
+		if err == nil || !strings.Contains(err.Error(), "session.secret_file") {
+			t.Errorf("err = %v, want a refusal naming session.secret_file", err)
+		}
+	})
+
+	t.Run("short secret", func(t *testing.T) {
+		short := writeFile(t, "short.secret", "too-short", 0o600)
+
+		_, _, err := loadYAML(t, withSession("session:\n  enabled: true\n  secret_file: "+short+"\n"))
+		if err == nil || !strings.Contains(err.Error(), "at least 32") {
+			t.Errorf("err = %v, want a refusal naming the minimum length", err)
+		}
+	})
+
+	// An idle window longer than the absolute lifetime can never end a
+	// session, which makes it a setting that silently does nothing.
+	t.Run("idle longer than absolute", func(t *testing.T) {
+		_, _, err := loadYAML(t, withSession(
+			"session:\n  enabled: true\n  secret_file: "+secret+
+				"\n  absolute_timeout: 1h\n  idle_timeout: 2h\n"))
+		if err == nil || !strings.Contains(err.Error(), "idle_timeout") {
+			t.Errorf("err = %v, want a refusal naming idle_timeout", err)
+		}
+	})
+
+	// A login form on /auth would answer every authorization subrequest
+	// with an HTML page and a 200.
+	t.Run("login path shadows an endpoint", func(t *testing.T) {
+		_, _, err := loadYAML(t, withSession(
+			"session:\n  enabled: true\n  secret_file: "+secret+"\n  login_path: /auth\n"))
+		if err == nil || !strings.Contains(err.Error(), "session.login_path") {
+			t.Errorf("err = %v, want a refusal naming session.login_path", err)
+		}
+	})
+
+	t.Run("login and logout on the same path", func(t *testing.T) {
+		_, _, err := loadYAML(t, withSession(
+			"session:\n  enabled: true\n  secret_file: "+secret+
+				"\n  login_path: /sso\n  logout_path: /sso\n"))
+		if err == nil || !strings.Contains(err.Error(), "logout_path") {
+			t.Errorf("err = %v, want a refusal about the two paths being equal", err)
+		}
+	})
+
+	t.Run("relative path", func(t *testing.T) {
+		_, _, err := loadYAML(t, withSession(
+			"session:\n  enabled: true\n  secret_file: "+secret+"\n  login_path: login\n"))
+		if err == nil || !strings.Contains(err.Error(), "must start with a slash") {
+			t.Errorf("err = %v, want a refusal about the missing slash", err)
+		}
+	})
+
+	// Browsers reject SameSite=None without Secure, so the combination would
+	// mean no session cookie is ever stored.
+	t.Run("same_site none without secure", func(t *testing.T) {
+		_, _, err := loadYAML(t, withSession(
+			"session:\n  enabled: true\n  secret_file: "+secret+
+				"\n  same_site: none\n  secure: false\n"))
+		if err == nil || !strings.Contains(err.Error(), "same_site") {
+			t.Errorf("err = %v, want a refusal naming session.same_site", err)
+		}
+	})
+
+	t.Run("unknown same_site", func(t *testing.T) {
+		_, _, err := loadYAML(t, withSession(
+			"session:\n  enabled: true\n  secret_file: "+secret+"\n  same_site: sometimes\n"))
+		if err == nil || !strings.Contains(err.Error(), "same_site") {
+			t.Errorf("err = %v, want a refusal naming session.same_site", err)
+		}
+	})
+
+	t.Run("bad cookie name", func(t *testing.T) {
+		_, _, err := loadYAML(t, withSession(
+			"session:\n  enabled: true\n  secret_file: "+secret+"\n  cookie_name: \"session cookie\"\n"))
+		if err == nil || !strings.Contains(err.Error(), "cookie_name") {
+			t.Errorf("err = %v, want a refusal naming session.cookie_name", err)
+		}
+	})
+
+	t.Run("insecure cookie warns", func(t *testing.T) {
+		_, warnings, err := loadYAML(t, withSession(
+			"session:\n  enabled: true\n  secret_file: "+secret+"\n  secure: false\n"))
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+
+		if !containsSubstring(warnings, "plaintext HTTP") {
+			t.Errorf("warnings = %q, want one about the cookie travelling in the clear", warnings)
+		}
+	})
+
+	// A stateless cookie cannot be revoked, so a long lifetime is a
+	// credential that outlives the account being disabled.
+	t.Run("very long absolute timeout warns", func(t *testing.T) {
+		_, warnings, err := loadYAML(t, withSession(
+			"session:\n  enabled: true\n  secret_file: "+secret+
+				"\n  absolute_timeout: 720h\n  idle_timeout: 30m\n"))
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+
+		if !containsSubstring(warnings, "cannot be revoked") {
+			t.Errorf("warnings = %q, want one about revocation", warnings)
+		}
+	})
+
+	// A refresh interval at or above the idle window would let a session
+	// expire in the browser while the service still accepts it.
+	t.Run("refresh interval not below the idle window warns", func(t *testing.T) {
+		_, warnings, err := loadYAML(t, withSession(
+			"session:\n  enabled: true\n  secret_file: "+secret+
+				"\n  idle_timeout: 30m\n  refresh_interval: 45m\n"))
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+
+		if !containsSubstring(warnings, "refresh_interval") {
+			t.Errorf("warnings = %q, want one about refresh_interval", warnings)
+		}
+	})
+
+	t.Run("cookie domain warns", func(t *testing.T) {
+		_, warnings, err := loadYAML(t, withSession(
+			"session:\n  enabled: true\n  secret_file: "+secret+"\n  cookie_domain: .example.org\n"))
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+
+		if !containsSubstring(warnings, "every subdomain") {
+			t.Errorf("warnings = %q, want one about the cookie reaching subdomains", warnings)
+		}
+	})
+
+	// A missing template is a startup failure with a path in the message,
+	// not a 500 at the first login of the day.
+	t.Run("missing login template", func(t *testing.T) {
+		_, _, err := loadYAML(t, withSession(
+			"session:\n  enabled: true\n  secret_file: "+secret+
+				"\n  login_template: /does/not/exist.html\n"))
+		if err == nil || !strings.Contains(err.Error(), "login_template") {
+			t.Errorf("err = %v, want a refusal naming session.login_template", err)
+		}
+	})
+
+	// A secret that is never read cannot fail to be read: a disabled
+	// session must not turn a stale path into a startup failure.
+	t.Run("disabled ignores its settings", func(t *testing.T) {
+		_, _, err := loadYAML(t, withSession(
+			"session:\n  enabled: false\n  secret_file: /does/not/exist\n  login_path: /auth\n"))
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+	})
+}

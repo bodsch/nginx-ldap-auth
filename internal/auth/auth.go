@@ -75,12 +75,37 @@ type Request struct {
 	// PolicyHeader is the raw X-Auth-Policy value, unvalidated.
 	PolicyHeader string
 
-	// Authorization is the raw Authorization header value.
+	// Authorization is the raw Authorization header value. It is ignored
+	// when Credentials is set.
 	Authorization string
+
+	// Credentials, when set, are used instead of the Authorization header.
+	//
+	// This is how the login form reaches the same decision path as an
+	// auth_request: same policy resolution, same throttle, same cache, same
+	// directory. A second path would be a second set of rules to keep in
+	// step, and the one that drifts is always the one nobody is looking at.
+	Credentials *Credentials
 
 	// RemoteAddress is the client address, reduced to a bare IP by the HTTP
 	// layer. It keys the per-address throttle.
 	RemoteAddress string
+}
+
+// Credentials are a login name and password that arrived already separated.
+type Credentials struct {
+	User     string
+	Password string
+}
+
+// credentials returns the login name and password to evaluate, from whichever
+// of the two forms the request carries.
+func (r Request) credentials() (user, password string, err error) {
+	if r.Credentials != nil {
+		return ValidateCredentials(r.Credentials.User, r.Credentials.Password)
+	}
+
+	return ParseBasic(r.Authorization)
 }
 
 // Result is the decision.
@@ -198,6 +223,16 @@ func New(opts Options) (*Authenticator, error) {
 	}, nil
 }
 
+// ResolvePolicy exposes policy resolution to the HTTP layer.
+//
+// The session cookie names the policy it was issued for, so the HTTP layer has
+// to know which policy a request selects before it can decide whether a cookie
+// applies to it — and it must reach that answer through the same resolver, not
+// a second reading of the same header.
+func (a *Authenticator) ResolvePolicy(header string) (*policy.Entry, error) {
+	return a.policies.Resolve(header)
+}
+
 // Authenticate evaluates one request.
 func (a *Authenticator) Authenticate(ctx context.Context, req Request) Result {
 	entry, err := a.policies.Resolve(req.PolicyHeader)
@@ -219,9 +254,9 @@ func (a *Authenticator) Authenticate(ctx context.Context, req Request) Result {
 	}
 
 	// Parsed before the throttle is consulted, because the throttle needs
-	// the username to charge an attempt to an account. ParseBasic returns
-	// one even when it rejects the password as empty.
-	user, password, err := ParseBasic(req.Authorization)
+	// the username to charge an attempt to an account. Parsing returns one
+	// even when it rejects the password as empty.
+	user, password, err := req.credentials()
 
 	// The throttle gate covers every attempt that carries an identity,
 	// including the ones that never make it past parsing. Checking it only

@@ -1,30 +1,43 @@
 # shellcheck shell=bash
 #
-# The one thing that cannot be done declaratively: generating the cache pepper.
+# The one thing that cannot be done declaratively: generating the per-machine
+# secrets.
 #
-# It must not be created at package build time. Every installation would then
-# share one secret, and a cache leaked from any of them would be crackable
-# against all the others — which is exactly the property the pepper exists to
-# provide.
+# They must not be created at package build time. Every installation would then
+# share one secret — a leaked cache would be crackable against all the others,
+# and a session cookie minted anywhere would be valid everywhere. Being unique
+# per installation is the entire property both files exist to provide.
 
 _pepper=/etc/nginx-ldap-auth/cache-pepper.secret
+_session_secret=/etc/nginx-ldap-auth/session.secret
 
-_generate_pepper() {
-	if [ -f "${_pepper}" ]; then
+_generate_secret() {
+	local path="${1}"
+
+	if [ -f "${path}" ]; then
 		return 0
 	fi
 
-	install -dm0750 "$(dirname "${_pepper}")"
+	install -dm0750 "$(dirname "${path}")"
 
 	# umask rather than a chmod afterwards: the file must never exist, even
 	# briefly, with a mode that lets another user read it.
-	(umask 027 && openssl rand -hex 32 >"${_pepper}")
+	(umask 027 && openssl rand -hex 32 >"${path}")
 
-	printf '  generated %s\n' "${_pepper}"
+	printf '  generated %s\n' "${path}"
+}
+
+_generate_secrets() {
+	_generate_secret "${_pepper}"
+
+	# Generated whether or not sessions are enabled, so that turning them on
+	# is a one-line change to the configuration rather than a hunt for the
+	# command that makes the service start again.
+	_generate_secret "${_session_secret}"
 }
 
 post_install() {
-	_generate_pepper
+	_generate_secrets
 
 	cat <<'MESSAGE'
 
@@ -47,18 +60,27 @@ nginx-ldap-auth is installed but not yet configured.
   5. Wire up nginx. A complete server block is in
      /usr/share/doc/nginx-ldap-auth/examples/auth.conf
 
-The cache pepper has been generated. Keep it out of backups that travel, and
-note that replacing it invalidates the cache — which is harmless, given the
-60 second default TTL.
+  6. HTTP Basic Authentication has no logout and no expiry: a browser keeps
+     replaying the credentials until it is closed. For a login form and a
+     session that ends on its own, set session.enabled in the configuration
+     and use the nginx example in
+     /usr/share/doc/nginx-ldap-auth/examples/auth-session.conf
+
+The cache pepper and the session secret have been generated. Keep both out of
+backups that travel. Replacing the pepper invalidates the cache, which is
+harmless given the 60 second default TTL; replacing the session secret ends
+every session immediately, which is the closest thing to a "log everybody out"
+button this service has.
 
 MESSAGE
 }
 
 post_upgrade() {
-	# An installation that predates the pepper, or one whose pepper was
-	# removed, gets one here. An existing one is never touched: replacing it
-	# would silently invalidate every cache entry on every upgrade.
-	_generate_pepper
+	# An installation that predates either secret, or one whose secret was
+	# removed, gets one here. An existing one is never touched: replacing the
+	# pepper would silently invalidate every cache entry on every upgrade,
+	# and replacing the session secret would log everybody out.
+	_generate_secrets
 
 	cat <<'MESSAGE'
 
