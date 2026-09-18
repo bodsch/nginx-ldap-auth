@@ -11,8 +11,11 @@
 name: Release
 
 on:
-  push:
-    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Override version (defaults to the dispatched tag name)."
+        required: false
 
 jobs:
   release:
