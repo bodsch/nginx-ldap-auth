@@ -125,6 +125,11 @@ type loginPage struct {
 	// somebody that the account exists but the password is wrong is telling
 	// everybody which accounts exist.
 	Error string
+
+	// Decoration is a CSS rule declaring --login-emblem-mask and
+	// --login-skyline-mask, the two images of the built-in page as data:
+	// URIs. It belongs inside a <style> element.
+	Decoration template.CSS
 }
 
 // safeNext reduces a redirect target to something that cannot leave this site.
@@ -169,7 +174,8 @@ func (s *Sessions) loginURL(next string) string {
 // loginTemplate is the built-in form.
 //
 // It is one self-contained document: no stylesheet, no script, no font and no
-// image is fetched. A login page that depends on an external asset is a login
+// image is fetched — the two images of the decoration arrive inline, as data:
+// URIs (see loginDecoration). A login page that depends on an external asset is a login
 // page that fails while the site behind it is up, and a Content-Security-Policy
 // that permits none of them is a policy nothing can weaken later.
 var loginTemplate = template.Must(template.New("login").Parse(`<!DOCTYPE html>
@@ -180,12 +186,13 @@ var loginTemplate = template.Must(template.New("login").Parse(`<!DOCTYPE html>
 <meta name="referrer" content="same-origin">
 <title>Sign in{{if .Realm}} &middot; {{.Realm}}{{end}}</title>
 <style>
+{{.Decoration}}
 :root { color-scheme: light dark; --bg:#f4f4f5; --fg:#18181b; --card:#fff; --line:#d4d4d8; --muted:#52525b; --accent:#1d4ed8; --error:#b91c1c; }
 @media (prefers-color-scheme: dark) { :root { --bg:#18181b; --fg:#f4f4f5; --card:#27272a; --line:#3f3f46; --muted:#a1a1aa; --accent:#60a5fa; --error:#f87171; } }
 * { box-sizing: border-box; }
-body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center; padding:1.5rem;
+body { margin:0; min-height:100vh; display:flex; flex-direction:column; align-items:center; justify-content:center; padding:1.5rem;
        background:var(--bg); color:var(--fg); font:16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
-main { width:100%; max-width:22rem; background:var(--card); border:1px solid var(--line); border-radius:0.75rem; padding:1.75rem; }
+main { position:relative; z-index:1; width:100%; max-width:22rem; background:var(--card); border:1px solid var(--line); border-radius:0.75rem; padding:1.75rem; }
 h1 { margin:0 0 1.25rem; font-size:1.15rem; }
 label { display:block; margin-bottom:0.35rem; font-size:0.85rem; color:var(--muted); }
 input[type=text], input[type=password] { width:100%; padding:0.6rem 0.7rem; margin-bottom:1rem; font-size:1rem;
@@ -196,6 +203,20 @@ button { width:100%; padding:0.65rem; font-size:1rem; font-weight:600; color:#ff
 button:hover { filter:brightness(1.08); }
 .error { margin:0 0 1rem; padding:0.6rem 0.7rem; border-radius:0.4rem; font-size:0.9rem;
        color:var(--error); border:1px solid var(--error); }
+/* The decoration is drawn as masks, not as pictures: the file supplies the
+   shape, the colour is var(--fg), so it follows the light and the dark scheme.
+   A browser without mask support gets neither, rather than two solid blocks.
+   The emblem is a flex item above the form and is left without a size on short
+   windows; the skyline is fixed to the bottom edge, below the form. */
+@supports (mask-image: none) or (-webkit-mask-image: none) {
+  body::before, body::after { content:""; pointer-events:none; background-color:var(--fg); }
+  @media (min-height: 640px) {
+    body::before { flex:none; width:min(520px, 72vw); aspect-ratio:1145 / 380; margin-bottom:1.5rem; opacity:.16;
+       -webkit-mask:var(--login-emblem-mask) center / contain no-repeat; mask:var(--login-emblem-mask) center / contain no-repeat; }
+  }
+  body::after { position:fixed; left:0; right:0; bottom:0; height:min(190px, 28vh); opacity:.09;
+       -webkit-mask:var(--login-skyline-mask) bottom left / auto 100% repeat-x; mask:var(--login-skyline-mask) bottom left / auto 100% repeat-x; }
+}
 </style>
 </head>
 <body>
@@ -222,6 +243,10 @@ button:hover { filter:brightness(1.08); }
 // redirect target to another site, and from being kept in a shared cache — all
 // three matter more here than on any other page this service serves, because
 // this is the one that takes a password.
+//
+// img-src admits data: and nothing else. It is what the masks of the
+// decoration are fetched under; a data: URI is part of the page, so it cannot
+// reach another host and adds nothing a script could use.
 func (s *Server) renderLogin(w http.ResponseWriter, status int, page loginPage) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
@@ -229,7 +254,7 @@ func (s *Server) renderLogin(w http.ResponseWriter, status int, page loginPage) 
 	w.Header().Set("X-Frame-Options", "DENY")
 	w.Header().Set("Referrer-Policy", "same-origin")
 	w.Header().Set("Content-Security-Policy",
-		"default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
+		"default-src 'none'; style-src 'unsafe-inline'; img-src data:; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
 
 	w.WriteHeader(status)
 

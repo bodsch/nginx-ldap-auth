@@ -1,0 +1,104 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 2200 260" role="img" aria-label="Hamburg skyline">
+  <title>Hamburg</title>
+  <!--
+    Stylised Hamburg harbour panorama, left to right: gantry crane,
+    Speicherstadt, Elbphilharmonie, St. Katharinen, Speicherstadt,
+    St. Michaelis, St. Nikolai, Rathaus, Chilehaus, gantry crane,
+    container terminal, office blocks, St. Petri.
+
+    The shapes are filled solid black because the stylesheet uses this file
+    as a mask, not as a picture: only the coverage matters, the colour comes
+    from the theme.
+
+    The viewBox is deliberately wide. The strip is scaled to its height, so
+    at the usual 190px it renders about 1600px across and a desktop shows
+    one panorama rather than the same crane twice. Wider screens repeat it,
+    and the quay runs the full width so that repetition has no seam.
+  -->
+  <g fill="#000" fill-rule="evenodd">
+    <!-- quay -->
+    <rect x="0" y="246" width="2200" height="14"/>
+
+    <!-- gantry crane, boom reaching left over the water -->
+    <path d="M72,246 V168 h8 v78 Z M150,246 V168 h8 v78 Z M62,160 h106 v10 H62 Z"/>
+    <path d="M108,160 L118,86 L128,160 Z"/>
+    <path d="M118,86 L20,114 v9 L118,98 Z"/>
+    <path d="M118,89 L196,110 v9 L118,101 Z"/>
+
+    <!-- Speicherstadt, stepped gables and a slim turret -->
+    <path d="M206,246 V150 h22 v-12 h22 v-12 h22 v12 h22 v12 h22 v96 Z"/>
+    <path d="M254,126 l8,-26 l8,26 Z"/>
+    <path d="M300,246 V162 h58 v84 Z M318,162 l10,-30 l10,30 Z"/>
+
+    <!-- Elbphilharmonie: the Kaispeicher block with the wave roof -->
+    <path d="M390,246 V148 h176 v98 Z"/>
+    <path d="M390,148 V140
+             L402,124 C410,104 422,88 436,84
+             C446,81 451,92 455,102
+             C459,112 466,116 472,111
+             C480,104 483,86 493,75
+             C503,64 515,60 523,67
+             C535,77 546,104 554,124
+             L566,140 V148 Z"/>
+
+    <!-- St. Katharinen: tower, baroque bulb, spire -->
+    <path d="M596,246 V132 h34 v114 Z M594,124 h38 v9 h-38 Z"/>
+    <path d="M598,124 C600,96 626,96 628,124 Z"/>
+    <path d="M608,100 h10 v-12 h-10 Z"/>
+    <path d="M609,88 L613,52 L617,88 Z"/>
+
+    <!-- Speicherstadt, wide, with a corner turret -->
+    <path d="M664,246 V158 h116 v88 Z
+             M676,158 l10,-24 l10,24 Z
+             M710,158 l10,-24 l10,24 Z
+             M744,158 l10,-24 l10,24 Z"/>
+    <path d="M782,246 V140 h20 v106 Z M780,132 h24 v9 h-24 Z M784,132 l8,-30 l8,30 Z"/>
+
+    <!-- St. Michaelis: tower with the clock, copper dome, lantern, spire -->
+    <path d="M838,246 V118 h44 v128 Z
+             M849,146 a11,11 0 1,0 22,0 a11,11 0 1,0 -22,0 Z"/>
+    <path d="M832,109 h56 v10 h-56 Z"/>
+    <path d="M838,109 C840,70 880,70 882,109 Z"/>
+    <path d="M851,78 h18 v-22 h-18 Z"/>
+    <path d="M851,56 C853,43 867,43 869,56 Z"/>
+    <path d="M857,45 L860,14 L863,45 Z"/>
+    <circle cx="860" cy="12" r="4"/>
+
+    <!-- St. Nikolai: the thin gothic spire, the tallest of them -->
+    <path d="M918,246 V146 h28 v100 Z M916,138 h32 v9 h-32 Z"/>
+    <path d="M924,138 L932,30 L940,138 Z"/>
+
+    <!-- Rathaus: block with the tower -->
+    <path d="M974,246 V176 h124 v70 Z"/>
+    <path d="M1018,176 V108 h36 v68 Z M1014,100 h44 v9 h-44 Z"/>
+    <path d="M1022,100 C1024,74 1048,74 1050,100 Z"/>
+    <path d="M1032,80 L1036,40 L1040,80 Z"/>
+
+    <!-- Chilehaus: the stepped office block -->
+    <path d="M1122,246 V190 h34 v-18 h34 v-16 h34 v-14 h30 v104 Z"/>
+
+    <!-- warehouses -->
+    <path d="M1284,246 V182 h70 v64 Z M1300,182 l10,-22 l10,22 Z M1330,182 l10,-22 l10,22 Z"/>
+
+    <!-- gantry crane, taller, boom reaching right -->
+    <path d="M1444,246 V158 h9 v88 Z M1534,246 V158 h9 v88 Z M1434,148 h119 v11 h-119 Z"/>
+    <path d="M1482,148 L1494,68 L1506,148 Z"/>
+    <path d="M1494,68 L1606,98 v10 L1494,81 Z"/>
+    <path d="M1494,72 L1404,94 v10 L1494,85 Z"/>
+
+    <!-- container terminal -->
+    <path d="M1628,246 V214 h64 v32 Z M1642,214 V196 h36 v18 Z"/>
+    <path d="M1706,246 V222 h48 v24 Z"/>
+
+    <!-- modern office blocks -->
+    <path d="M1782,246 V164 h46 v82 Z M1836,246 V186 h38 v60 Z M1882,246 V150 h34 v96 Z"/>
+
+    <!-- St. Petri -->
+    <path d="M1950,246 V156 h26 v90 Z M1948,148 h30 v9 h-30 Z"/>
+    <path d="M1955,148 L1963,56 L1971,148 Z"/>
+
+    <!-- low warehouses running out to the edge -->
+    <path d="M2006,246 V196 h58 v50 Z M2020,196 l10,-20 l10,20 Z"/>
+    <path d="M2092,246 V210 h54 v36 Z"/>
+  </g>
+</svg>

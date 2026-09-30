@@ -223,8 +223,17 @@ curl -u alice https://intranet.example.org/api/report
 `session.login_template` points at an `html/template` parsed at startup, so a
 syntax error stops the service rather than surfacing as a 500 at the first
 login. It is rendered with `.Realm`, `.Policy`, `.Action`, `.Next`,
-`.CSRFToken`, `.Username` and `.Error`; the form has to post `username`,
-`password`, `csrf_token` and `next` back to `.Action`.
+`.CSRFToken`, `.Username`, `.Error` and `.Decoration`; the form has to post
+`username`, `password`, `csrf_token` and `next` back to `.Action`.
+
+The built-in form shows an emblem above the fields and a Hamburg harbour
+panorama along the bottom edge — the same as the webmailer's and
+mail-monkey's login. Both are part of the binary and arrive inline, as `data:`
+URIs, so the page still fetches nothing and needs no nginx location of its own;
+the Content-Security-Policy admits `img-src data:` for them and nothing else.
+`.Decoration` is a CSS rule declaring the two as `--login-emblem-mask` and
+`--login-skyline-mask`: a replacement form that wants them puts
+`{{.Decoration}}` into its `<style>` and uses the properties as `mask-image`.
 
 ## Policies
 

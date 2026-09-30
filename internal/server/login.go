@@ -268,13 +268,14 @@ func (s *Server) renderLoginForm(
 	}
 
 	s.renderLogin(w, status, loginPage{
-		Realm:     realm,
-		Policy:    policyName,
-		Action:    s.sessions.loginURL(next),
-		Next:      next,
-		CSRFToken: token,
-		Username:  username,
-		Error:     message,
+		Realm:      realm,
+		Policy:     policyName,
+		Action:     s.sessions.loginURL(next),
+		Next:       next,
+		CSRFToken:  token,
+		Username:   username,
+		Error:      message,
+		Decoration: loginDecoration,
 	})
 }
 

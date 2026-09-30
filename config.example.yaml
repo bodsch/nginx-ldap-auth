@@ -180,7 +180,7 @@ session:
   logout_path: /logout
 
   # Replaces the built-in form. An html/template, parsed at startup, rendered
-  # with .Realm .Policy .Action .Next .CSRFToken .Username .Error
+  # with .Realm .Policy .Action .Next .CSRFToken .Username .Error .Decoration
   # login_template: /etc/nginx-ldap-auth/login.html
 
   # Keeps HTTP Basic Authentication working for curl, monitoring checks and API
