@@ -11,6 +11,13 @@
 name: Release
 
 on:
+  push:
+    # No leading "v": the tags in this repository are 0.9.0, 1.0.0 and so on,
+    # which is what `git describe` then hands the Makefile as VERSION. The
+    # pattern used to be "v*" and therefore matched nothing that was ever
+    # tagged here — 0.9.0 was built by hand and nobody noticed the workflow had
+    # not run. Do not "fix" this back.
+    tags: ["[0-9]*"]
   workflow_dispatch:
     inputs:
       version:
